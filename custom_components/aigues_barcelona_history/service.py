@@ -1,14 +1,17 @@
-"""Services for Aigues de Barcelona."""
+"""Services for Aigües Barcelona History."""
 
 from __future__ import annotations
 
 import logging
 
-import voluptuous as vol
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.typing import ConfigType
+import voluptuous as vol
 
-from .const import CONF_CONTRACT, CONF_HISTORY_DAYS, DOMAIN, HISTORY_DAYS_DEFAULT
+from .const import CONF_CONTRACT, CONF_HISTORY_DAYS, DEFAULT_HISTORY_DAYS, DOMAIN
+from .identity import canonical_contracts
+from .settings import validate_history_days
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -18,11 +21,26 @@ SERVICE_RESET_AND_REFRESH_DATA = "reset_and_refresh_data"
 SERVICE_SCHEMA = vol.Schema(
     {
         vol.Optional(CONF_CONTRACT): str,
-        vol.Optional(CONF_HISTORY_DAYS, default=365): vol.All(
-            int, vol.Range(min=1, max=HISTORY_DAYS_DEFAULT)
-        ),
+        vol.Optional(CONF_HISTORY_DAYS, default=DEFAULT_HISTORY_DAYS): validate_history_days,
+        vol.Optional("frequency", default="ALL"): vol.In(["ALL", "DAILY", "HOURLY"]),
     }
 )
+
+
+async def async_run_import(hass, coordinator, *, frequency="ALL", days=None):
+    """Give service and button imports the same entry-owned lifecycle."""
+    entry = hass.config_entries.async_get_entry(coordinator.entry_id)
+    if entry is None:
+        raise HomeAssistantError("History config entry is no longer available")
+    coroutine = (
+        coordinator.import_configured_consumptions(frequency=frequency)
+        if days is None
+        else coordinator.import_old_consumptions(days=days, frequency=frequency)
+    )
+    task = entry.async_create_background_task(
+        hass, coroutine, f"{DOMAIN} manual import {coordinator.contract} {frequency}"
+    )
+    await task
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -33,9 +51,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     ) -> None:
         coordinator = _get_coordinator(hass, call.data.get(CONF_CONTRACT))
         if coordinator is None:
-            return
+            raise HomeAssistantError("History contract coordinator not found")
 
-        days = call.data.get(CONF_HISTORY_DAYS, 365)
+        days = call.data.get(CONF_HISTORY_DAYS, DEFAULT_HISTORY_DAYS)
         if legacy_reset_alias:
             _LOGGER.warning(
                 "Legacy reset_and_refresh_data service called for %s. "
@@ -50,7 +68,12 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 coordinator.contract,
             )
 
-        await fetch_historic_data(coordinator, days=days)
+        await async_run_import(
+            hass,
+            coordinator,
+            days=days,
+            frequency=call.data.get("frequency", "ALL"),
+        )
 
     async def handle_import_historical_data(call: ServiceCall) -> None:
         await _handle_history_import(call)
@@ -58,8 +81,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     async def handle_reset_and_refresh_data(call: ServiceCall) -> None:
         """Backward-compatible service name.
 
-        This service does not clear statistics because clear_statistics is unsafe from
-        this context in current Home Assistant versions. It only imports history.
+        The alias uses the same import path without clearing statistics.
         """
         await _handle_history_import(call, legacy_reset_alias=True)
 
@@ -94,7 +116,7 @@ def _get_coordinator(hass: HomeAssistant, contract: str | None):
         return None
 
     if contract:
-        selected = contracts.get(contract.upper())
+        selected = contracts.get(canonical_contracts([contract])[0])
         if selected is None:
             _LOGGER.error("Contract coordinator for %s not found", contract)
             return None
@@ -113,13 +135,3 @@ def _get_coordinator(hass: HomeAssistant, contract: str | None):
         return None
 
     return coordinator
-
-
-async def clear_stored_data(coordinator) -> None:
-    """Clear stored statistics."""
-    await coordinator._clear_statistics()
-
-
-async def fetch_historic_data(coordinator, days: int = 365) -> None:
-    """Fetch historical consumption data."""
-    await coordinator.import_old_consumptions(days=days)
