@@ -1,0 +1,86 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "invalid_auth": "Invalid credentials",
+      "contract_already_configured": "A water contract is already configured in another History entry."
+    },
+    "error": {
+      "already_configured": "Error: Account is already configured",
+      "invalid_auth": "The account credentials or supplied token were rejected.",
+      "token_expired": "The supplied token has expired. Supply a current token or submit credentials to sign in.",
+      "cannot_connect": "The provider could not be reached or returned invalid data. Try again later.",
+      "auth_session_limit": "Aigües has reached its session limit. Close an existing provider session or supply a valid token before trying again. Automatic sign-in is paused.",
+      "no_contracts": "No available water contracts were returned for this account.",
+      "invalid_settings": "Use whole days between 1 and 1825, a refresh interval between 15 and 1440 minutes, and a whole number of seconds."
+    },
+    "step": {
+      "user": {
+        "data": {
+          "username": "Username (DNI/NIE)",
+          "password": "Password",
+          "twocaptcha_api_key": "2Captcha API key",
+          "token": "Existing access token (optional)"
+        },
+        "title": "Aigües Barcelona History",
+        "description": "Submit credentials to sign in through 2Captcha, which incurs one CAPTCHA charge. Alternatively, provide an existing token to validate it without a new login."
+      },
+      "token": {
+        "data": {
+          "token": "Existing access token"
+        },
+        "title": "Aigües Barcelona History: validate existing token",
+        "description": "The token is checked through a read-only contracts request. This does not create a new session or purchase a CAPTCHA."
+      },
+      "reauth_confirm": {
+        "data": {
+          "username": "Username (DNI/NIE)",
+          "password": "Password",
+          "twocaptcha_api_key": "2Captcha API key",
+          "token": "Existing access token (optional)"
+        },
+        "title": "Aigües Barcelona History: sign in again",
+        "description": "Opening this form does not sign in. Submit without a token to use the saved credentials and pay for one CAPTCHA, or provide an existing token to validate it without a new login. The existing account and configured contracts are preserved."
+      },
+      "import_settings": {
+        "title": "History import settings",
+        "description": "Choose how much hourly consumption and daily reference history to request. Aigües may return less data than requested. Existing saved history is kept.",
+        "data": {
+          "hourly_history_days": "Hourly history to request",
+          "history_days": "Daily reference history to request",
+          "scan_interval_minutes": "Refresh interval",
+          "should_import_history": "Import both histories after setup (once)"
+        },
+        "data_description": {
+          "hourly_history_days": "Number of past days to request, plus today. Used by the hourly import button and the one-time import. Available hourly history may be shorter.",
+          "history_days": "Number of past days to request for the separate daily reference, plus today. These totals do not fill missing hours or replace hourly water use.",
+          "scan_interval_minutes": "Recent consumption refreshes automatically at this interval. The configured histories can be requested separately with their import buttons.",
+          "should_import_history": "Run both configured imports once after setup. This switches off after a successful import. Use the import buttons whenever you need to request data again."
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "History and refresh settings",
+        "description": "Set the range used by each import button and the automatic refresh interval. Changing a range does not delete saved data. Enable the one-time import to request both histories after saving.",
+        "data": {
+          "hourly_history_days": "Hourly history to request",
+          "history_days": "Daily reference history to request",
+          "scan_interval_minutes": "Refresh interval",
+          "should_import_history": "Import both histories after saving (once)"
+        },
+        "data_description": {
+          "hourly_history_days": "Number of past days to request, plus today. Used by the hourly import button and the one-time import. Available hourly history may be shorter.",
+          "history_days": "Number of past days to request for the separate daily reference, plus today. These totals do not fill missing hours or replace hourly water use.",
+          "scan_interval_minutes": "Recent consumption refreshes automatically at this interval. The configured histories can be requested separately with their import buttons.",
+          "should_import_history": "Run both configured imports once after saving. This switches off after a successful import. Completed imports do not repeat on every restart. You can use the import buttons later."
+        }
+      }
+    },
+    "error": {
+      "invalid_settings": "Use whole days between 1 and 1825, a refresh interval between 15 and 1440 minutes, and a whole number of seconds."
+    }
+  }
+}

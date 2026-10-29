@@ -1,0 +1,50 @@
+---
+# Service call documentation for Aigües Barcelona History integration
+
+import_historical_data:
+  name: "Aigües Barcelona History: import historical data"
+  description: >-
+    Request hourly consumption, the daily reference, or both. Existing history is kept.
+    For saved import ranges, use the buttons on the contract's device page.
+  fields: &history_import_fields
+    contract:
+      name: Contract
+      description: Contract number. Required when multiple contracts are configured.
+      required: false
+      selector:
+        text:
+    history_days:
+      name: Days to request
+      description: >-
+        Past days to request, plus today. Applies to each selected history;
+        the import buttons use their separate saved ranges.
+      required: false
+      default: 365
+      selector:
+        number:
+          min: 1
+          max: 1825
+          step: 1
+          mode: box
+          unit_of_measurement: days
+    frequency:
+      name: History to import
+      description: >-
+        Hourly consumption supplies Energy. The daily reference is a separate provider report.
+      required: false
+      default: ALL
+      selector:
+        select:
+          options:
+            - value: ALL
+              label: Hourly consumption and daily reference
+            - value: HOURLY
+              label: Hourly consumption
+            - value: DAILY
+              label: Daily reference
+
+reset_and_refresh_data:
+  name: "Aigües Barcelona History: import historical data (legacy)"
+  description: >-
+    Legacy name for the same import action. Saved history is kept.
+  fields: *history_import_fields

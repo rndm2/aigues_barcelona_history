@@ -1,0 +1,37 @@
+name: Bug report
+description: Report an import, statistics, setup or authentication problem.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not include credentials, account/contract identifiers, CAPTCHA keys,
+        tokens, storage/database exports or private consumption traces.
+  - type: input
+    id: version
+    attributes:
+      label: History version
+    validations:
+      required: true
+  - type: input
+    id: homeassistant
+    attributes:
+      label: Home Assistant version
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Include the action, requested range and whether the provider returned data.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics and reviewed logs
+      description: Attach integration diagnostics. Review any additional logs before sharing.

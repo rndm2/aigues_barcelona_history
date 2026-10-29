@@ -1,8 +1,7 @@
 {
-  "name": "Aigües de Barcelona",
-  "render_readme": true,
+  "name": "Aigües Barcelona History",
   "country": "ES",
-  "homeassistant": "2024.8.0",
+  "homeassistant": "2026.10.4",
   "content_in_root": false,
   "zip_release": false
 }
