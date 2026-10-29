@@ -32,6 +32,10 @@ class ReleasePackageTests(unittest.TestCase):
                     )
                 )
                 self.assertFalse(any("__pycache__" in name or "/tests/" in name for name in names))
+                self.assertEqual(
+                    archive.read("custom_components/aigues_barcelona_history/brand/icon.png")[:8],
+                    b"\x89PNG\r\n\x1a\n",
+                )
                 manifest = json.loads(
                     archive.read("custom_components/aigues_barcelona_history/manifest.json")
                 )

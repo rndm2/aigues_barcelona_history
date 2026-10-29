@@ -1,6 +1,9 @@
 {
   "domain": "aigues_barcelona_history",
   "name": "Aigües Barcelona History",
+  "categories": [
+    "water.meters_leak_detection"
+  ],
   "codeowners": [
     "@rndm2"
   ],
