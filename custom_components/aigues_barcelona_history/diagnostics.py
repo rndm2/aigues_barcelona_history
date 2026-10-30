@@ -11,7 +11,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant
 from voluptuous import Invalid
 
-from .const import CONF_AUTH_SESSION_LIMIT, CONF_RETRY_NOT_BEFORE
+from .const import CONF_AUTH_SESSION_LIMIT, CONF_RETRY_NOT_BEFORE, IMPORT_PHASES
 from .settings import effective_settings
 from .statistics import Frequency
 from .version import VERSION
@@ -37,6 +37,23 @@ def _interval_counts(ledger: Any) -> dict[str, int | None]:
         )
         for frequency in Frequency
     }
+
+
+def _import_progress(data: Any) -> dict:
+    """Allow operational progress only, excluding window dates and error text."""
+    status = data.get("import_status") if isinstance(data, Mapping) else None
+    status = status if isinstance(status, Mapping) else {}
+    phase = status.get("phase")
+    frequency = status.get("frequency")
+    progress = {
+        "phase": phase if isinstance(phase, str) and phase in IMPORT_PHASES else "unknown",
+        "frequency": frequency if isinstance(frequency, str) and frequency in Frequency else None,
+        "has_error": isinstance(status.get("last_error"), str) and bool(status["last_error"]),
+    }
+    for key in ("completed_windows", "total_windows"):
+        value = status.get(key)
+        progress[key] = value if type(value) is int and value >= 0 else None
+    return progress
 
 
 async def async_get_config_entry_diagnostics(
@@ -71,6 +88,7 @@ async def async_get_config_entry_diagnostics(
                 ),
                 "ledger_loaded": ledger is not None,
                 "saved_intervals": _interval_counts(ledger),
+                "import_status": _import_progress(getattr(coordinator, "_data", None)),
             }
         )
 

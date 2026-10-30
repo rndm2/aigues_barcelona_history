@@ -96,6 +96,13 @@ class HistoryDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                         "startup_import_pending": False,
                         "ledger_loaded": True,
                         "saved_intervals": {"daily": 1, "hourly": 2},
+                        "import_status": {
+                            "phase": "unknown",
+                            "frequency": None,
+                            "has_error": False,
+                            "completed_windows": None,
+                            "total_windows": None,
+                        },
                     }
                 ],
             },
@@ -111,6 +118,51 @@ class HistoryDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.coordinator._ledger["HOURLY"][PRIVATE]["self"] = self.coordinator._ledger
         result = await self.report()
         self.assertEqual(result["meters"][0]["saved_intervals"], {"daily": 1, "hourly": 2})
+
+    async def test_progress_excludes_private_window_dates_and_all_error_details(self):
+        self.coordinator._data["import_status"] = {
+            "phase": "retrying",
+            "frequency": "HOURLY",
+            "completed_windows": 3,
+            "total_windows": 54,
+            "current_window_start": PRIVATE,
+            "current_window_end": PRIVATE,
+            "last_error": PRIVATE,
+            "provider_response": PRIVATE,
+        }
+        result = await self.report()
+        self.assertEqual(
+            result["meters"][0]["import_status"],
+            {
+                "phase": "retrying",
+                "frequency": "HOURLY",
+                "has_error": True,
+                "completed_windows": 3,
+                "total_windows": 54,
+            },
+        )
+
+    async def test_malformed_progress_cannot_disclose_private_values(self):
+        status = {
+            "phase": PRIVATE,
+            "frequency": PRIVATE,
+            "completed_windows": PRIVATE,
+            "total_windows": True,
+            "last_error": {"private": PRIVATE},
+        }
+        status["self"] = status
+        self.coordinator._data["import_status"] = status
+        result = await self.report()
+        self.assertEqual(
+            result["meters"][0]["import_status"],
+            {
+                "phase": "unknown",
+                "frequency": None,
+                "has_error": False,
+                "completed_windows": None,
+                "total_windows": None,
+            },
+        )
 
     async def test_failed_setup_without_runtime_data_remains_diagnosable(self):
         del self.entry.runtime_data

@@ -237,6 +237,23 @@ def reconcile_intervals(current, incoming, frequency, timezone, *, startdate, en
     return result | selected
 
 
+def _interval_starts(ledger):
+    return sorted(_aware_datetime(row["start"], "start") for row in ledger.values())
+
+
+def _interval_span(starts):
+    return {
+        "first_interval": starts[0].isoformat() if starts else None,
+        "last_interval": starts[-1].isoformat() if starts else None,
+        "known_intervals": len(starts),
+    }
+
+
+def describe_interval_coverage(ledger) -> dict:
+    """Describe the actual saved span without filling absent source intervals."""
+    return _interval_span(_interval_starts(ledger))
+
+
 def describe_hourly_coverage(ledger, timezone: tzinfo) -> dict:
     """Describe provider-reported hourly coverage without creating source rows.
 
@@ -246,11 +263,9 @@ def describe_hourly_coverage(ledger, timezone: tzinfo) -> dict:
     known date are outside it. Only incomplete dates are listed individually.
     """
     canonical = validate_saved_ledger(ledger, Frequency.HOURLY, timezone)
-    starts = sorted(_aware_datetime(row["start"], "start") for row in canonical.values())
+    starts = _interval_starts(canonical)
     coverage = {
-        "first_interval": starts[0].isoformat() if starts else None,
-        "last_interval": starts[-1].isoformat() if starts else None,
-        "known_intervals": len(starts),
+        **_interval_span(starts),
         "expected_intervals": 0,
         "complete_days": 0,
         "incomplete_days": {},

@@ -32,15 +32,22 @@ async def async_run_import(hass, coordinator, *, frequency="ALL", days=None):
     entry = hass.config_entries.async_get_entry(coordinator.entry_id)
     if entry is None:
         raise HomeAssistantError("History config entry is no longer available")
+    coordinator._set_manual_import_reserved(True)
     coroutine = (
         coordinator.import_configured_consumptions(frequency=frequency)
         if days is None
         else coordinator.import_old_consumptions(days=days, frequency=frequency)
     )
-    task = entry.async_create_background_task(
-        hass, coroutine, f"{DOMAIN} manual import {coordinator.contract} {frequency}"
-    )
-    await task
+    task = None
+    try:
+        task = entry.async_create_background_task(
+            hass, coroutine, f"{DOMAIN} manual import {coordinator.contract} {frequency}"
+        )
+        await task
+    finally:
+        if task is None:
+            coroutine.close()
+        coordinator._set_manual_import_reserved(False)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:

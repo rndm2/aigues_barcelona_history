@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from homeassistant.const import Platform
-from homeassistant.core import CoreState
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_START, Platform
+from homeassistant.core import CoreState, HomeAssistant
 
 from custom_components import aigues_barcelona_history as integration
 from custom_components.aigues_barcelona_history import button, sensor
@@ -62,6 +63,7 @@ class HistoryPlatformSetupTests(unittest.IsolatedAsyncioTestCase):
             },
             config_entries=self.entries,
             state=CoreState.not_running,
+            is_running=False,
             bus=SimpleNamespace(async_listen_once=Mock(return_value=Mock())),
         )
 
@@ -137,7 +139,7 @@ class HistoryPlatformSetupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.entry.runtime_data), 2)
         await self.run_unload_callbacks()
         self.assertFalse(getattr(self.entry, "runtime_data", ()))
-        self.assertEqual(set(self.hass.data[DOMAIN]), {"_token_lock", "OTHER"})
+        self.assertEqual(set(self.hass.data[DOMAIN]), {"_token_lock", "_request_gate", "OTHER"})
         self.assert_other_integrations_unchanged()
 
     async def test_partial_constructor_failure_is_cleaned_before_platform_forward(self):
@@ -155,7 +157,7 @@ class HistoryPlatformSetupTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ONE", self.hass.data[DOMAIN])
         await self.run_unload_callbacks()
         self.assertFalse(getattr(self.entry, "runtime_data", ()))
-        self.assertEqual(set(self.hass.data[DOMAIN]), {"_token_lock", "OTHER"})
+        self.assertEqual(set(self.hass.data[DOMAIN]), {"_token_lock", "_request_gate", "OTHER"})
         self.assert_other_integrations_unchanged()
 
     async def test_failed_unload_keeps_owners_and_successful_cleanup_is_idempotent(self):
@@ -171,5 +173,131 @@ class HistoryPlatformSetupTests(unittest.IsolatedAsyncioTestCase):
         await self.run_unload_callbacks()
         await self.run_unload_callbacks()
         self.assertFalse(self.entry.runtime_data)
-        self.assertEqual(set(self.hass.data[DOMAIN]), {"_token_lock", "OTHER"})
+        self.assertEqual(set(self.hass.data[DOMAIN]), {"_token_lock", "_request_gate", "OTHER"})
         self.assert_other_integrations_unchanged()
+
+
+class HistoryStartupLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    """Use HA's real event bus and entry-owned task cleanup for startup refreshes."""
+
+    async def asyncSetUp(self):
+        self.hass = HomeAssistant("/tmp/aigues-history-startup-tests")
+        self.addCleanup(self.hass.import_executor.shutdown)
+        self.entry = ConfigEntry(
+            version=2,
+            minor_version=1,
+            domain=DOMAIN,
+            title="History startup test",
+            data={},
+            options={},
+            source="user",
+            unique_id=None,
+            discovery_keys=MappingProxyType({}),
+            subentries_data=None,
+        )
+        self.addAsyncCleanup(self.entry._async_process_on_unload, self.hass)
+        self.coordinators = tuple(SimpleNamespace(async_refresh=AsyncMock()) for _ in range(2))
+        self.entry.runtime_data = self.coordinators
+        self.meters = []
+        self.enterContext(
+            patch.object(
+                sensor,
+                "AiguesHistoryMeter",
+                side_effect=lambda owner: SimpleNamespace(coordinator=owner),
+            )
+        )
+        self.create_task = self.enterContext(
+            patch.object(
+                self.entry,
+                "async_create_background_task",
+                wraps=self.entry.async_create_background_task,
+            )
+        )
+
+    async def setup_sensor(self):
+        await sensor.async_setup_entry(self.hass, self.entry, self.meters.extend)
+
+    async def fire_start(self):
+        self.hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
+        await self.hass.async_block_till_done(wait_background_tasks=True)
+
+    def assert_refresh_count(self, count):
+        self.assertEqual(self.create_task.call_count, count)
+        for owner in self.coordinators:
+            self.assertEqual(owner.async_refresh.await_count, count)
+
+    async def test_start_event_then_unload_does_not_remove_consumed_listener(self):
+        await self.setup_sensor()
+        self.assertEqual(self.hass.bus.async_listeners()[EVENT_HOMEASSISTANT_START], 1)
+        self.assert_refresh_count(0)
+        with self.assertNoLogs("homeassistant.core", level="ERROR"):
+            await self.fire_start()
+            await self.fire_start()
+            await self.entry._async_process_on_unload(self.hass)
+        self.assert_refresh_count(1)
+        self.assertNotIn(EVENT_HOMEASSISTANT_START, self.hass.bus.async_listeners())
+
+    async def test_unload_before_start_removes_listener_without_refresh(self):
+        await self.setup_sensor()
+        with self.assertNoLogs("homeassistant.core", level="ERROR"):
+            await self.entry._async_process_on_unload(self.hass)
+            await self.entry._async_process_on_unload(self.hass)
+            await self.fire_start()
+        self.assert_refresh_count(0)
+        self.assertNotIn(EVENT_HOMEASSISTANT_START, self.hass.bus.async_listeners())
+
+    async def test_reload_after_start_creates_only_one_new_refresh(self):
+        await self.setup_sensor()
+        await self.fire_start()
+        self.hass.set_state(CoreState.running)
+        with self.assertNoLogs("homeassistant.core", level="ERROR"):
+            await self.entry._async_process_on_unload(self.hass)
+            await self.setup_sensor()
+            await self.hass.async_block_till_done(wait_background_tasks=True)
+            await self.fire_start()
+            await self.entry._async_process_on_unload(self.hass)
+        self.assert_refresh_count(2)
+        self.assertNotIn(EVENT_HOMEASSISTANT_START, self.hass.bus.async_listeners())
+
+    async def test_setup_while_running_refreshes_once_without_start_listener(self):
+        self.hass.set_state(CoreState.running)
+        await self.setup_sensor()
+        await self.hass.async_block_till_done(wait_background_tasks=True)
+        await self.fire_start()
+        with self.assertNoLogs("homeassistant.core", level="ERROR"):
+            await self.entry._async_process_on_unload(self.hass)
+        self.assert_refresh_count(1)
+        self.assertNotIn(EVENT_HOMEASSISTANT_START, self.hass.bus.async_listeners())
+
+    async def test_setup_while_starting_does_not_wait_for_another_start_event(self):
+        self.hass.set_state(CoreState.starting)
+        await self.setup_sensor()
+        await self.hass.async_block_till_done(wait_background_tasks=True)
+        self.assert_refresh_count(1)
+        self.assertNotIn(EVENT_HOMEASSISTANT_START, self.hass.bus.async_listeners())
+
+    async def test_unload_cancels_the_entry_owned_startup_refresh(self):
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def wait_for_provider():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        self.coordinators[0].async_refresh.side_effect = wait_for_provider
+        await self.setup_sensor()
+        self.hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        self.assertEqual(len(self.entry._background_tasks), 1)
+        pending = next(iter(self.entry._background_tasks))
+        with self.assertNoLogs("homeassistant.core", level="ERROR"):
+            await self.entry._async_process_on_unload(self.hass)
+            await self.fire_start()
+        self.assertTrue(pending.cancelled())
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(self.entry._background_tasks)
+        self.assertEqual(self.create_task.call_count, 1)
+        self.coordinators[0].async_refresh.assert_awaited_once()
+        self.coordinators[1].async_refresh.assert_not_awaited()

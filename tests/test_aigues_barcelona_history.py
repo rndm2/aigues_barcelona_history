@@ -97,15 +97,18 @@ def make_coordinator(store=None):
     coordinator.sensor_unique_id = f"{DOMAIN}_{OBJECT_ID}_meter"
     coordinator.statistic_ids = {Frequency.DAILY: DAILY_ID, Frequency.HOURLY: HOURLY_ID}
     coordinator.entry_id = entry.entry_id
-    coordinator._data = {}
+    coordinator._data = {"import_status": sensor._empty_import_status()}
     coordinator._ledger = None
     coordinator._stopping = False
+    coordinator._manual_import_reserved = False
     coordinator._store = store or FakeStore()
     coordinator._lock, coordinator._token_lock = asyncio.Lock(), asyncio.Lock()
+    coordinator._request_gate = {"lock": asyncio.Lock(), "next_request_at": 0}
     coordinator._history_days, coordinator._should_import_history = 7, False
     coordinator.last_update_success = True
     coordinator._ensure_token = AsyncMock()
     coordinator.async_set_updated_data = Mock()
+    coordinator.async_update_listeners = Mock()
     coordinator._api = Mock(spec=AiguesBarcelonaHistoryApiClient)
     coordinator._api.consumptions.return_value = []
     return coordinator
@@ -128,6 +131,7 @@ class OfflineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.enterContext(patch.object(sensor.dt_util, "DEFAULT_TIME_ZONE", MADRID))
         self.enterContext(patch.object(sensor.dt_util, "now", return_value=NOW))
+        self.enterContext(patch.object(sensor, "MIN_REQUEST_INTERVAL_SECONDS", 0))
         self.recorded = {}
         self.recorded_metadata = {}
         self.queue = SimpleNamespace(
@@ -419,7 +423,10 @@ class RefreshAndManualImportTests(OfflineTests):
                 call(date(2026, 10, 29), date(2026, 10, 30), CONTRACT, frequency="HOURLY"),
             ],
         )
-        self.coordinator._ensure_token.assert_awaited_once_with()
+        self.assertEqual(
+            self.coordinator._ensure_token.await_count,
+            self.coordinator._api.consumptions.call_count,
+        )
 
     async def test_refresh_failure_surfaces_updatefailed(self):
         self.enterContext(patch.object(sensor.asyncio, "sleep", new_callable=AsyncMock))
@@ -449,7 +456,8 @@ class RefreshAndManualImportTests(OfflineTests):
         self.assertFalse(self.coordinator._should_import_history)
         self.assertFalse(entry.options[CONF_SHOULD_IMPORT_HISTORY])
         self.assertEqual(entry.options[CONF_HISTORY_DAYS], 365)
-        self.coordinator.async_set_updated_data.assert_called_once_with(self.coordinator._data)
+        self.assertEqual(self.coordinator.async_set_updated_data.call_count, 2)
+        self.coordinator.async_set_updated_data.assert_called_with(self.coordinator._data)
         await self.coordinator.import_old_consumptions(days=2, frequency="DAILY")
         self.coordinator.hass.config_entries.async_update_entry.assert_called_once()
         self.assertTrue(
@@ -469,7 +477,8 @@ class RefreshAndManualImportTests(OfflineTests):
             await self.coordinator.import_old_consumptions(days=2)
         self.assertTrue(self.coordinator._should_import_history)
         self.coordinator.hass.config_entries.async_update_entry.assert_not_called()
-        self.coordinator.async_set_updated_data.assert_not_called()
+        self.coordinator.async_set_updated_data.assert_called_once_with(self.coordinator._data)
+        self.assertEqual(self.coordinator._data["import_status"]["phase"], "failed")
 
 
 class IdentityAndIsolationTests(OfflineTests):
@@ -508,6 +517,8 @@ class IdentityAndIsolationTests(OfflineTests):
         self.assertIs(first._token_lock, second._token_lock)
         self.assertIs(first._token_lock, hass.data[DOMAIN]["_token_lock"])
         self.assertIsNot(first._token_lock, old_lock)
+        self.assertIs(first._request_gate, second._request_gate)
+        self.assertIs(first._request_gate, hass.data[DOMAIN]["_request_gate"])
 
     async def test_first_refreshes_are_sequential_within_one_background_task(self):
         entered, release = asyncio.Event(), asyncio.Event()
@@ -536,8 +547,14 @@ class IdentityAndIsolationTests(OfflineTests):
             async_create_background_task=Mock(
                 side_effect=lambda hass, coroutine, name: background.append(coroutine)
             ),
+            async_on_unload=Mock(),
         )
-        hass = SimpleNamespace(data={}, state=CoreState.running)
+        hass = SimpleNamespace(
+            data={},
+            state=CoreState.running,
+            is_running=True,
+            async_run_hass_job=lambda job, *args: job.target(*args),
+        )
         with (
             patch.object(sensor, "AiguesHistoryCoordinator", side_effect=[first, second]),
             patch.object(
@@ -674,7 +691,10 @@ class IdentityAndIsolationTests(OfflineTests):
         coordinator = SimpleNamespace(async_refresh=AsyncMock())
         entry.runtime_data = (coordinator,)
         hass = SimpleNamespace(
-            data={}, state=CoreState.not_running, bus=SimpleNamespace(async_listen_once=Mock())
+            data={},
+            state=CoreState.not_running,
+            is_running=False,
+            bus=SimpleNamespace(async_listen_once=Mock()),
         )
         with (
             patch.object(sensor, "AiguesHistoryCoordinator") as coordinator_class,
@@ -697,7 +717,10 @@ class IdentityAndIsolationTests(OfflineTests):
         )
         old = SimpleNamespace(contract=CONTRACT, import_old_consumptions=AsyncMock())
         new = SimpleNamespace(
-            contract=CONTRACT, entry_id="history-entry", import_old_consumptions=AsyncMock()
+            contract=CONTRACT,
+            entry_id="history-entry",
+            import_old_consumptions=AsyncMock(),
+            _set_manual_import_reserved=Mock(),
         )
         entry = SimpleNamespace(
             async_create_background_task=lambda hass, coroutine, name: asyncio.create_task(

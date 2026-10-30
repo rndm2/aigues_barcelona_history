@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, Mock
 
 from test_aigues_barcelona_history import MADRID, OfflineTests, make_coordinator, reading
 
@@ -45,14 +45,14 @@ class ConfiguredImportTests(OfflineTests):
         self.coordinator._fetch = AsyncMock(return_value={})
         await self.coordinator.import_configured_consumptions(clear_startup_request=True)
         self.assertEqual(
-            self.coordinator._fetch.await_args_list,
+            [item.args for item in self.coordinator._fetch.await_args_list],
             [
-                call(date(2026, 10, 27), date(2026, 10, 30), Frequency.HOURLY),
-                call(date(2026, 10, 9), date(2026, 10, 30), Frequency.DAILY),
+                (date(2026, 10, 27), date(2026, 10, 30), Frequency.HOURLY),
+                (date(2026, 10, 9), date(2026, 10, 30), Frequency.DAILY),
             ],
         )
         self.coordinator._store.async_save.assert_awaited_once()
-        self.coordinator._ensure_token.assert_awaited_once()
+        self.coordinator._ensure_token.assert_not_awaited()
         self.assertFalse(self.coordinator._should_import_history)
         self.assertFalse(self.entry.options[CONF_SHOULD_IMPORT_HISTORY])
 
@@ -80,14 +80,16 @@ class ConfiguredImportTests(OfflineTests):
     async def test_button_import_uses_current_depth_and_retains_unrelated_startup_request(self):
         self.coordinator._fetch = AsyncMock(return_value={})
         await self.coordinator.async_import_configured_history("HOURLY")
-        self.coordinator._fetch.assert_awaited_once_with(
-            date(2026, 10, 27), date(2026, 10, 30), Frequency.HOURLY
+        self.assertEqual(
+            self.coordinator._fetch.await_args.args,
+            (date(2026, 10, 27), date(2026, 10, 30), Frequency.HOURLY),
         )
         self.entry.options[CONF_HOURLY_HISTORY_DAYS] = 4
         self.coordinator._fetch.reset_mock()
         await self.coordinator.async_import_configured_history("HOURLY")
-        self.coordinator._fetch.assert_awaited_once_with(
-            date(2026, 10, 25), date(2026, 10, 30), Frequency.HOURLY
+        self.assertEqual(
+            self.coordinator._fetch.await_args.args,
+            (date(2026, 10, 25), date(2026, 10, 30), Frequency.HOURLY),
         )
         self.assertEqual(self.entry.async_create_background_task.call_count, 2)
         self.assertTrue(self.coordinator._should_import_history)
@@ -97,8 +99,9 @@ class ConfiguredImportTests(OfflineTests):
     async def test_daily_button_does_not_fetch_hourly_history_or_clear_startup(self):
         self.coordinator._fetch = AsyncMock(return_value={})
         await self.coordinator.async_import_configured_history("DAILY")
-        self.coordinator._fetch.assert_awaited_once_with(
-            date(2026, 10, 9), date(2026, 10, 30), Frequency.DAILY
+        self.assertEqual(
+            self.coordinator._fetch.await_args.args,
+            (date(2026, 10, 9), date(2026, 10, 30), Frequency.DAILY),
         )
         self.assertTrue(self.coordinator._should_import_history)
         self.assertTrue(self.entry.options[CONF_SHOULD_IMPORT_HISTORY])
@@ -106,7 +109,7 @@ class ConfiguredImportTests(OfflineTests):
     async def test_unload_cancels_the_entry_owned_button_import_without_saving(self):
         started = asyncio.Event()
 
-        async def pending_fetch(*args):
+        async def pending_fetch(*args, **kwargs):
             started.set()
             await asyncio.Event().wait()
 

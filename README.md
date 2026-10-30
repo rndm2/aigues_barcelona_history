@@ -17,6 +17,7 @@ against 2026.10.4. This unofficial integration uses the private customer-portal 
 - Scoped corrections and backfills without duplicate consumption.
 - Previously saved hours retained when responses are partial or empty.
 - Separate import ranges, refresh minutes and two import buttons per contract.
+- Visible import progress and failures, with duplicate manual runs rejected.
 - Durable source intervals, recorder readback and temporary-request retries.
 - Privacy-preserving diagnostics with settings, counts and status only.
 
@@ -92,6 +93,11 @@ Regular refreshes revisit **seven past days plus today**. They do not repeat the
 entire configured range. Use a button for older gaps or provider corrections.
 Changing settings reloads the entry; normal expired-token recovery still applies.
 
+The meter's `import_status` attribute reports the current phase, request window
+and completed/total windows. Loaded readings remain visible during a backfill.
+A second manual import is rejected while work is pending or running. Wait for
+the active job to finish before requesting another range.
+
 ## Energy
 
 For example contract `EXAMPLE123`:
@@ -111,6 +117,36 @@ The display sensor shows the latest provider-reported meter reading. External
 consumption statistics are published separately. Its `hourly_coverage` attribute
 reports incomplete dates within the known span; it does not certify dates after
 the latest returned hour.
+
+### View older reference history
+
+Energy only contains the reported hours selected as its source. Importing the
+separate daily reference does not create hourly history or extend Energy into
+years where hours are unavailable.
+
+Use the native **Statistics graph** card with the provider daily-reference ID,
+`period: month` and `stat_types: [change]` to view monthly sums of available daily
+reports. Use a separate card with the canonical hourly ID for recent hours.
+The meter's `provider_daily_coverage` and `hourly_coverage` attributes show the
+known source ranges. A successful request cannot guarantee that the provider
+retains every requested date.
+
+```yaml
+type: statistics-graph
+title: Monthly provider reference
+days_to_show: 1825
+period: month
+chart_type: bar
+stat_types:
+  - change
+entities:
+  - entity: aigues_barcelona_history:example123_consumption
+```
+
+Portal invoice charts describe whole billing periods, which can span more than
+one calendar month. Their end-date labels do not make the amounts monthly
+consumption. Keep billed periods separate rather than splitting them into
+invented monthly or hourly readings.
 
 ## Time, corrections and persistence
 
@@ -140,6 +176,9 @@ rows are read back and compared by timestamp, state and sum. Failed publication
 is replayed from durable source data on a later run. The two series are not one
 shared SQL transaction. Temporary GET failures retry up to five attempts, with
 1/2/4/8-second backoff and persisted provider Retry-After deadlines.
+Consumption requests are also spaced by at least one second across History
+meters. Longer provider pauses take precedence. Long imports check the token
+between request windows rather than relying only on the token at startup.
 
 ## Explicit import action
 

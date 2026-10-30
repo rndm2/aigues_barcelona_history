@@ -62,7 +62,9 @@ class HistoryImportButton(CoordinatorEntity, ButtonEntity):
     def available(self):
         """Allow retrying an import after a failed provider update."""
         return not (
-            self.coordinator._stopping or getattr(self.coordinator, "_shutdown_requested", False)
+            self.coordinator._stopping
+            or getattr(self.coordinator, "_shutdown_requested", False)
+            or getattr(self.coordinator, "import_in_progress", False)
         )
 
     @property
