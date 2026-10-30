@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.2 — 2026-10-30
+
+- Add saved From/To date selectors and a manual hourly-range import button to each History device.
+- Add a date-picker action for inclusive Aigües reporting dates, using the shared manual-import lifecycle and retry policy.
+- Persist explicit request ranges before provider I/O, retaining old empty or failed dates for bounded background retries.
+- Keep corrections scoped to requested provider dates and preserve existing HA-calendar day-count imports.
+- Restore date selections and allow edits without changing a running job's captured range.
+
 ## 0.5.1 — 2026-10-30
 
 - Retry incomplete older hourly reporting blocks without an age cutoff.

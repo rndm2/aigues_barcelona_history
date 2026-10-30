@@ -13,7 +13,7 @@ from .const import CONF_CONTRACT, DOMAIN
 from .identity import canonical_contracts
 from .service import async_setup as setup_service
 
-PLATFORMS = [Platform.SENSOR, Platform.BUTTON]
+PLATFORMS = [Platform.SENSOR, Platform.BUTTON, Platform.DATE]
 
 
 def conflicting_contracts(hass: HomeAssistant, contracts, entry_id=None) -> set[str]:

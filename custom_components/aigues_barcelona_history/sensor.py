@@ -72,6 +72,7 @@ from .const import (
     DEFAULT_HISTORY_DAYS,
     DOMAIN,
     IMPORT_PHASES,
+    MAX_HISTORY_DAYS,
     NAME,
 )
 from .identity import (
@@ -85,6 +86,7 @@ from .statistics import (
     HOURLY_INTERVAL,
     PROVIDER_TIME_ZONE,
     Frequency,
+    add_hourly_requested_range,
     build_energy_projection,
     build_statistics,
     describe_hourly_coverage,
@@ -95,6 +97,8 @@ from .statistics import (
     pending_hourly_provider_days,
     plan_windows,
     reconcile_intervals,
+    validate_hourly_import_range,
+    validate_hourly_requested_ranges,
     validate_saved_ledger,
 )
 
@@ -116,6 +120,17 @@ def _empty_import_status():
         "current_window_end": None,
         "completed_windows": 0,
         "total_windows": 0,
+        "last_error": None,
+    }
+
+
+def _empty_hourly_reconciliation(pending_days=0):
+    """Use one operational status shape for manual and background imports."""
+    return {
+        "pending_days": pending_days,
+        "request_limit": MAX_HOURLY_BACKFILL_REQUESTS,
+        "attempted_requests": 0,
+        "completed_days": 0,
         "last_error": None,
     }
 
@@ -158,6 +173,10 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         self._energy_hourly_since = None
         self._energy_projection_initialized = False
         self._hourly_backfill_attempts = {}
+        self._hourly_requested_ranges = []
+        provider_today = dt_util.now().astimezone(PROVIDER_TIME_ZONE).date()
+        self.hourly_import_start = provider_today - timedelta(days=7)
+        self.hourly_import_end = provider_today
         self.entry_id = entry.entry_id
         self._should_import_history = settings[CONF_SHOULD_IMPORT_HISTORY]
         self._lock = asyncio.Lock()
@@ -412,6 +431,9 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 saved = {frequency.value: {} for frequency in Frequency}
             if not isinstance(saved, dict):
                 raise ValueError("Saved History intervals must be a mapping")
+            self._hourly_requested_ranges = validate_hourly_requested_ranges(
+                saved.get("hourly_requested_ranges", [])
+            )
             try:
                 self._hourly_backfill_attempts = validate_hourly_backfill_attempts(
                     saved.get("hourly_backfill_attempts", {})
@@ -473,7 +495,9 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                     await self._save_ledger(candidate)
             self._ledger = candidate
 
-    async def _save_ledger(self, ledger, *, replay_pending=None, backfill_attempts=None) -> None:
+    async def _save_ledger(
+        self, ledger, *, replay_pending=None, backfill_attempts=None, requested_ranges=None
+    ) -> None:
         """Persist source intervals and replay state together before recorder writes."""
         if replay_pending is None:
             replay_pending = getattr(self, "_hourly_replay_pending", False)
@@ -487,6 +511,9 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         attempts = validate_hourly_backfill_attempts(
             self._hourly_backfill_attempts if backfill_attempts is None else backfill_attempts
         )
+        requested = validate_hourly_requested_ranges(
+            self._hourly_requested_ranges if requested_ranges is None else requested_ranges
+        )
         pending = {
             day.isoformat()
             for day in pending_hourly_provider_days(
@@ -495,6 +522,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 dt_util.DEFAULT_TIME_ZONE,
                 hourly_since=since,
                 current_provider_date=dt_util.now().astimezone(PROVIDER_TIME_ZONE).date(),
+                requested_ranges=requested,
             )
         }
         attempts = {day: attempted_at for day, attempted_at in attempts.items() if day in pending}
@@ -505,6 +533,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             "energy_projection_version": ENERGY_PROJECTION_VERSION,
             "energy_hourly_since": (since.isoformat() if since else None),
             "hourly_backfill_attempts": attempts,
+            "hourly_requested_ranges": requested,
         }
         if replay_pending:
             saved["hourly_replay_source_sha256"] = self._hourly_source_sha256(
@@ -515,6 +544,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         self._energy_hourly_since = since
         self._energy_projection_initialized = True
         self._hourly_backfill_attempts = attempts
+        self._hourly_requested_ranges = requested
 
     @staticmethod
     def _hourly_source_sha256(hourly_ledger) -> str:
@@ -674,6 +704,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 dt_util.DEFAULT_TIME_ZONE,
                 hourly_since=self._energy_hourly_since,
                 current_provider_date=provider_today,
+                requested_ranges=self._hourly_requested_ranges,
             )
             selected = plan_hourly_backfill(
                 pending,
@@ -681,13 +712,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 now=now.timestamp(),
                 current_provider_date=provider_today,
             )
-            status = {
-                "pending_days": len(pending),
-                "request_limit": MAX_HOURLY_BACKFILL_REQUESTS,
-                "attempted_requests": 0,
-                "completed_days": 0,
-                "last_error": None,
-            }
+            status = _empty_hourly_reconciliation(len(pending))
             self._data["hourly_reconciliation"] = status
             original_status = dict(self._data["import_status"])
             try:
@@ -757,6 +782,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                             dt_util.DEFAULT_TIME_ZONE,
                             hourly_since=self._energy_hourly_since,
                             current_provider_date=provider_today,
+                            requested_ranges=self._hourly_requested_ranges,
                         )
                         status["completed_days"] += int(day not in still_pending)
                         status["pending_days"] = len(still_pending)
@@ -767,13 +793,13 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 if not self._stopping and not getattr(self, "_shutdown_requested", False):
                     self.async_update_listeners()
 
-    def _fetch_windows(self, start: date, end: date, frequency: Frequency):
+    def _fetch_windows(self, start: date, end: date, frequency: Frequency, *, provider_dates=False):
         """Use one request plan for fetching and visible progress totals."""
         if start >= end:
             plan_windows(start, end, frequency)  # Validate reversed or invalid bounds.
             return []
         query_begin, query_stop = start, end
-        if frequency is Frequency.HOURLY:
+        if frequency is Frequency.HOURLY and not provider_dates:
             # Each reading closes the preceding UTC hour. Include the closing
             # reading at the requested end boundary, also across DST changes.
             first_end = dt_util.as_utc(dt_util.start_of_local_day(start)) + HOURLY_INTERVAL
@@ -791,9 +817,15 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             split_at=provider_today,
         )
 
-    async def _fetch(self, start: date, end: date, frequency: Frequency, *, windows=None) -> dict:
+    async def _fetch(
+        self, start: date, end: date, frequency: Frequency, *, windows=None, provider_dates=False
+    ) -> dict:
         result = {}
-        windows = self._fetch_windows(start, end, frequency) if windows is None else windows
+        windows = (
+            self._fetch_windows(start, end, frequency, provider_dates=provider_dates)
+            if windows is None
+            else windows
+        )
         for query_start, query_end in windows:
             self._set_import_status(
                 phase="running",
@@ -814,6 +846,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 dt_util.DEFAULT_TIME_ZONE,
                 startdate=start if frequency is Frequency.HOURLY else query_start,
                 enddate=end if frequency is Frequency.HOURLY else response_stop,
+                provider_dates=provider_dates,
             )
             result = reconcile_intervals(
                 result,
@@ -822,6 +855,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 dt_util.DEFAULT_TIME_ZONE,
                 startdate=start,
                 enddate=end,
+                provider_dates=provider_dates,
             )
             self._set_import_status(
                 completed_windows=self._data["import_status"]["completed_windows"] + 1
@@ -831,11 +865,13 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
     async def _import_range(self, start: date, end: date, frequencies: tuple) -> None:
         await self._import_ranges({frequency: (start, end) for frequency in frequencies})
 
-    async def _import_ranges(self, ranges: dict) -> None:
+    async def _import_ranges(self, ranges: dict, *, provider_dates=False) -> None:
         """Commit different hourly/reference depths as one validated batch."""
         async with self._lock:
+            if provider_dates and set(ranges) != {Frequency.HOURLY}:
+                raise ValueError("Provider-date range imports require hourly history only")
             plans = {
-                frequency: self._fetch_windows(start, end, frequency)
+                frequency: self._fetch_windows(start, end, frequency, provider_dates=provider_dates)
                 for frequency, (start, end) in ranges.items()
             }
             self._data["import_status"] = _empty_import_status()
@@ -845,6 +881,13 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             try:
                 self._assert_active()
                 await self._load_ledger()
+                if provider_dates:
+                    requested = add_hourly_requested_range(
+                        self._hourly_requested_ranges, *ranges[Frequency.HOURLY]
+                    )
+                    # Remember explicit intent before provider I/O, including
+                    # dates for which the API returns no observations at all.
+                    await self._save_ledger(self._ledger, requested_ranges=requested)
                 await self._publish()
                 self._update_display()
                 # Verified cached readings remain useful while a long import runs.
@@ -852,7 +895,13 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 await self._wait_for_request(0)
                 candidate = dict(self._ledger)
                 for frequency, (start, end) in ranges.items():
-                    incoming = await self._fetch(start, end, frequency, windows=plans[frequency])
+                    incoming = await self._fetch(
+                        start,
+                        end,
+                        frequency,
+                        windows=plans[frequency],
+                        provider_dates=provider_dates,
+                    )
                     candidate[frequency.value] = reconcile_intervals(
                         candidate[frequency.value],
                         incoming,
@@ -860,6 +909,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                         dt_util.DEFAULT_TIME_ZONE,
                         startdate=start,
                         enddate=end,
+                        provider_dates=provider_dates,
                     )
                 candidate, _ = self._prepare_statistics(candidate)
                 self._assert_active()
@@ -1009,6 +1059,17 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         self._data["energy_coverage"] = coverage
 
     def _update_display(self) -> None:
+        pending = pending_hourly_provider_days(
+            self._ledger[Frequency.DAILY.value],
+            self._ledger[Frequency.HOURLY.value],
+            dt_util.DEFAULT_TIME_ZONE,
+            hourly_since=self._energy_hourly_since,
+            current_provider_date=dt_util.now().astimezone(PROVIDER_TIME_ZONE).date(),
+            requested_ranges=self._hourly_requested_ranges,
+        )
+        self._data.setdefault("hourly_reconciliation", _empty_hourly_reconciliation())[
+            "pending_days"
+        ] = len(pending)
         readings = [row for ledger in self._ledger.values() for row in ledger.values()]
         if readings:
             latest = max(readings, key=lambda row: datetime.fromisoformat(row["observed_at"]))
@@ -1059,6 +1120,32 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         from .service import async_run_import
 
         await async_run_import(self.hass, self, frequency=frequency)
+
+    async def import_hourly_date_range(self, start_date, end_date) -> None:
+        """Import an inclusive range of provider reporting dates and retain its intent."""
+        try:
+            start, stop = validate_hourly_import_range(
+                start_date,
+                end_date,
+                today_provider=dt_util.now().astimezone(PROVIDER_TIME_ZONE).date(),
+                max_days=MAX_HISTORY_DAYS,
+            )
+        except ValueError as error:
+            raise HomeAssistantError(str(error)) from error
+        await self._import_ranges({Frequency.HOURLY: (start, stop)}, provider_dates=True)
+        self.async_set_updated_data(self._data)
+
+    async def async_import_hourly_date_range(self) -> None:
+        """Run the selected device dates through the shared manual-import lifecycle."""
+        from .service import async_run_import
+
+        await async_run_import(
+            self.hass,
+            self,
+            frequency=Frequency.HOURLY.value,
+            start_date=self.hourly_import_start,
+            end_date=self.hourly_import_end,
+        )
 
     async def _import_days(self, days: dict, *, clear_startup_request: bool) -> None:
         today = dt_util.now().date()

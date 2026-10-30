@@ -99,7 +99,7 @@ class HistoryPlatformSetupTests(unittest.IsolatedAsyncioTestCase):
         sensors, buttons = [], []
 
         async def forward(entry, platforms):
-            self.assertEqual(set(platforms), {Platform.SENSOR, Platform.BUTTON})
+            self.assertEqual(set(platforms), {Platform.SENSOR, Platform.BUTTON, Platform.DATE})
             self.assertIsInstance(entry.runtime_data, tuple)
             self.assertEqual([owner.contract for owner in entry.runtime_data], ["ONE", "TWO"])
             for owner in entry.runtime_data:
@@ -122,10 +122,10 @@ class HistoryPlatformSetupTests(unittest.IsolatedAsyncioTestCase):
         self.entries.async_forward_entry_setups.side_effect = forward
         self.assertTrue(await integration.async_setup_entry(self.hass, self.entry))
         self.assertEqual(len(sensors), 2)
-        self.assertEqual(len(buttons), 4)
+        self.assertEqual(len(buttons), 6)
         for owner in self.entry.runtime_data:
             self.assertEqual(sum(entity.coordinator is owner for entity in sensors), 1)
-            self.assertEqual(sum(entity.coordinator is owner for entity in buttons), 2)
+            self.assertEqual(sum(entity.coordinator is owner for entity in buttons), 3)
         self.assertEqual(len({id(entity.coordinator) for entity in [*sensors, *buttons]}), 2)
         self.refresh.assert_not_awaited()
         self.entry.async_create_background_task.assert_not_called()

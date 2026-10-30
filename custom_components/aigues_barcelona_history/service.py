@@ -6,6 +6,7 @@ import logging
 
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.selector import DateSelector
 from homeassistant.helpers.typing import ConfigType
 import voluptuous as vol
 
@@ -17,6 +18,7 @@ _LOGGER = logging.getLogger(__name__)
 
 SERVICE_IMPORT_HISTORICAL_DATA = "import_historical_data"
 SERVICE_RESET_AND_REFRESH_DATA = "reset_and_refresh_data"
+SERVICE_IMPORT_HOURLY_DATE_RANGE = "import_hourly_date_range"
 
 SERVICE_SCHEMA = vol.Schema(
     {
@@ -26,18 +28,44 @@ SERVICE_SCHEMA = vol.Schema(
     }
 )
 
+HOURLY_DATE_RANGE_SCHEMA = vol.Schema(
+    {
+        vol.Optional(CONF_CONTRACT): str,
+        vol.Required("start_date"): DateSelector(),
+        vol.Required("end_date"): DateSelector(),
+    }
+)
 
-async def async_run_import(hass, coordinator, *, frequency="ALL", days=None):
+
+def manual_import_available(coordinator, *, allow_during_import: bool = False) -> bool:
+    """Keep manual recovery controls usable after a provider refresh failure."""
+    return not (
+        coordinator._stopping
+        or getattr(coordinator, "_shutdown_requested", False)
+        or (not allow_during_import and getattr(coordinator, "import_in_progress", False))
+    )
+
+
+async def async_run_import(
+    hass, coordinator, *, frequency="ALL", days=None, start_date=None, end_date=None
+):
     """Give service and button imports the same entry-owned lifecycle."""
+    date_range = start_date is not None or end_date is not None
+    if date_range and (start_date is None or end_date is None):
+        raise HomeAssistantError("Select both hourly import reporting dates")
+    if date_range and (days is not None or frequency not in ("ALL", "HOURLY")):
+        raise HomeAssistantError("A reporting-date range imports hourly history only")
     entry = hass.config_entries.async_get_entry(coordinator.entry_id)
     if entry is None:
         raise HomeAssistantError("History config entry is no longer available")
     coordinator._set_manual_import_reserved(True)
-    coroutine = (
-        coordinator.import_configured_consumptions(frequency=frequency)
-        if days is None
-        else coordinator.import_old_consumptions(days=days, frequency=frequency)
-    )
+    if date_range:
+        frequency = "HOURLY"
+        coroutine = coordinator.import_hourly_date_range(start_date, end_date)
+    elif days is None:
+        coroutine = coordinator.import_configured_consumptions(frequency=frequency)
+    else:
+        coroutine = coordinator.import_old_consumptions(days=days, frequency=frequency)
     task = None
     try:
         task = entry.async_create_background_task(
@@ -92,21 +120,30 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         """
         await _handle_history_import(call, legacy_reset_alias=True)
 
-    if not hass.services.has_service(DOMAIN, SERVICE_IMPORT_HISTORICAL_DATA):
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_IMPORT_HISTORICAL_DATA,
-            handle_import_historical_data,
-            schema=SERVICE_SCHEMA,
+    async def handle_import_hourly_date_range(call: ServiceCall) -> None:
+        """Import both selected provider reporting dates and every date between."""
+        coordinator = _get_coordinator(hass, call.data.get(CONF_CONTRACT))
+        if coordinator is None:
+            raise HomeAssistantError("History contract coordinator not found")
+        await async_run_import(
+            hass,
+            coordinator,
+            frequency="HOURLY",
+            start_date=call.data["start_date"],
+            end_date=call.data["end_date"],
         )
 
-    if not hass.services.has_service(DOMAIN, SERVICE_RESET_AND_REFRESH_DATA):
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_RESET_AND_REFRESH_DATA,
-            handle_reset_and_refresh_data,
-            schema=SERVICE_SCHEMA,
-        )
+    for name, handler, schema in (
+        (SERVICE_IMPORT_HISTORICAL_DATA, handle_import_historical_data, SERVICE_SCHEMA),
+        (SERVICE_RESET_AND_REFRESH_DATA, handle_reset_and_refresh_data, SERVICE_SCHEMA),
+        (
+            SERVICE_IMPORT_HOURLY_DATE_RANGE,
+            handle_import_hourly_date_range,
+            HOURLY_DATE_RANGE_SCHEMA,
+        ),
+    ):
+        if not hass.services.has_service(DOMAIN, name):
+            hass.services.async_register(DOMAIN, name, handler, schema=schema)
 
     return True
 

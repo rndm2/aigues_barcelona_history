@@ -9,6 +9,7 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
+from .service import manual_import_available
 from .statistics import Frequency
 
 
@@ -17,6 +18,7 @@ class HistoryImportButtonDescription(ButtonEntityDescription):
     """Describe one import action without duplicating its implementation."""
 
     frequency: Frequency
+    date_range: bool = False
 
 
 IMPORT_BUTTONS = (
@@ -36,13 +38,22 @@ IMPORT_BUTTONS = (
     ),
 )
 
+HOURLY_RANGE_BUTTON = HistoryImportButtonDescription(
+    key="import_hourly_date_range",
+    name="Import hourly date range",
+    icon="mdi:calendar-clock",
+    entity_category=EntityCategory.CONFIG,
+    frequency=Frequency.HOURLY,
+    date_range=True,
+)
+
 
 async def async_setup_entry(hass, entry, async_add_entities):
-    """Expose two actions for each coordinator owned by this History entry."""
+    """Expose configured imports and the selected hourly reporting-date range."""
     async_add_entities(
         HistoryImportButton(coordinator, description)
         for coordinator in entry.runtime_data
-        for description in IMPORT_BUTTONS
+        for description in (*IMPORT_BUTTONS, HOURLY_RANGE_BUTTON)
     )
 
 
@@ -61,11 +72,7 @@ class HistoryImportButton(CoordinatorEntity, ButtonEntity):
     @property
     def available(self):
         """Allow retrying an import after a failed provider update."""
-        return not (
-            self.coordinator._stopping
-            or getattr(self.coordinator, "_shutdown_requested", False)
-            or getattr(self.coordinator, "import_in_progress", False)
-        )
+        return manual_import_available(self.coordinator)
 
     @property
     def device_info(self):
@@ -73,6 +80,9 @@ class HistoryImportButton(CoordinatorEntity, ButtonEntity):
 
     async def async_press(self):
         """Use the same import path as startup and explicit service calls."""
+        if self.entity_description.date_range:
+            await self.coordinator.async_import_hourly_date_range()
+            return
         await self.coordinator.async_import_configured_history(
             self.entity_description.frequency.value
         )

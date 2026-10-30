@@ -102,6 +102,9 @@ def make_coordinator(store=None):
     coordinator._energy_hourly_since = None
     coordinator._energy_projection_initialized = False
     coordinator._hourly_backfill_attempts = {}
+    coordinator._hourly_requested_ranges = []
+    coordinator.hourly_import_start = NOW.date()
+    coordinator.hourly_import_end = NOW.date()
     coordinator.entry_id = entry.entry_id
     coordinator._data = {"import_status": sensor._empty_import_status()}
     coordinator._ledger = None
@@ -225,6 +228,7 @@ class CoordinatorLedgerTests(OfflineTests):
                 "energy_projection_version",
                 "energy_hourly_since",
                 "hourly_backfill_attempts",
+                "hourly_requested_ranges",
             },
         )
         self.assertEqual(store.saved["hourly_interval_version"], 2)
@@ -823,10 +827,18 @@ class ProviderCompatibilityTests(OfflineTests):
         self.assertEqual((manifest["domain"], manifest["name"]), (DOMAIN, NAME))
         self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
         definitions = yaml.safe_load(Path(service.__file__).with_name("services.yaml").read_text())
-        self.assertEqual(set(definitions), {"import_historical_data", "reset_and_refresh_data"})
-        for definition in definitions.values():
+        self.assertEqual(
+            set(definitions),
+            {"import_historical_data", "reset_and_refresh_data", "import_hourly_date_range"},
+        )
+        for name, definition in definitions.items():
             self.assertTrue(definition["name"].startswith(f"{NAME}: "))
-            self.assertEqual(set(definition["fields"]), {"contract", "history_days", "frequency"})
+            expected_fields = (
+                {"contract", "start_date", "end_date"}
+                if name == "import_hourly_date_range"
+                else {"contract", "history_days", "frequency"}
+            )
+            self.assertEqual(set(definition["fields"]), expected_fields)
 
 
 if __name__ == "__main__":
