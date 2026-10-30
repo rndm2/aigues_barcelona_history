@@ -61,8 +61,8 @@ class CalendarViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fixture.database_rows(self.fixture.old_id), self.fixture.old_snapshot)
 
     async def test_local_calendar_day_uses_its_actual_boundary_hours(self):
-        # Synthetic fixed-CET report: 120 L. The HA day includes a preceding
-        # 15 L interval and excludes the outgoing 5 L interval, giving 130 L.
+        # Synthetic fixed-CET report: 120 L, observed at each interval end.
+        # The reading just after midnight closes the preceding calendar day.
         raw_day_deltas_l = [5] * 24
         self.assertEqual(sum(raw_day_deltas_l), 120)
         counter = Decimal("100.000")
@@ -81,13 +81,13 @@ class CalendarViewTests(unittest.IsolatedAsyncioTestCase):
         days = self.ha_rows(date(2026, 10, 23), "day")
         self.assertEqual(len(hours), 24)
         self.assertEqual(len(days), 1)
-        self.assertAlmostEqual(sum(row["change"] for row in hours), 130)
-        self.assertAlmostEqual(days[0]["change"], 130)
-        self.assertAlmostEqual(hours[0]["change"], 15)
+        self.assertAlmostEqual(sum(row["change"] for row in hours), 120)
+        self.assertAlmostEqual(days[0]["change"], 120)
+        self.assertAlmostEqual(hours[0]["change"], 5)
         self.assertEqual(
             datetime.fromtimestamp(hours[0]["start"], UTC), datetime(2026, 10, 22, 22, tzinfo=UTC)
         )
-        self.assertAlmostEqual(days[0]["state"], 100130)
+        self.assertAlmostEqual(days[0]["state"], 100135)
         self.assert_native_unchanged()
 
     async def test_actual_ha_calendar_reduction_handles_23_and_25_hour_days(self):
@@ -96,7 +96,7 @@ class CalendarViewTests(unittest.IsolatedAsyncioTestCase):
                 start, stop = self.bounds(day)
                 rows = [
                     reading(
-                        (start + timedelta(hours=index, minutes=1)).isoformat(),
+                        (start + timedelta(hours=index + 1, minutes=1)).isoformat(),
                         100 + index / 1000,
                         0.001,
                     )
@@ -130,7 +130,9 @@ class CalendarViewTests(unittest.IsolatedAsyncioTestCase):
         omitted = start + timedelta(hours=5)
         rows = [
             reading(
-                (start + timedelta(hours=index, minutes=1)).isoformat(), 100 + index / 1000, 0.001
+                (start + timedelta(hours=index + 1, minutes=1)).isoformat(),
+                100 + index / 1000,
+                0.001,
             )
             for index in range(24)
             if index != 5
@@ -148,9 +150,9 @@ class CalendarViewTests(unittest.IsolatedAsyncioTestCase):
     async def test_partial_backfill_and_correction_preserve_outside_consumption(self):
         day = date(2026, 10, 23)
         initial = [
-            reading("2026-10-23T00:01:00+02:00", 100.001, 0.001),
-            reading("2026-10-23T02:01:00+02:00", 100.003, 0.001),
-            reading("2026-10-24T00:01:00+02:00", 100.004, 0.001),
+            reading("2026-10-23T01:01:00+02:00", 100.001, 0.001),
+            reading("2026-10-23T03:01:00+02:00", 100.003, 0.001),
+            reading("2026-10-24T01:01:00+02:00", 100.004, 0.001),
         ]
         await self.import_rows(initial, day, day + timedelta(days=2))
         outside_key = "2026-10-23T22:00:00+00:00"
@@ -159,10 +161,10 @@ class CalendarViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(self.ha_rows(day + timedelta(days=1), "day")[0]["change"], 1)
 
         partial_update = [
-            reading("2026-10-23T00:01:00+02:00", 100.001, 0.002),
-            reading("2026-10-23T01:01:00+02:00", 100.002, 0.001),
+            reading("2026-10-23T01:01:00+02:00", 100.001, 0.002),
+            reading("2026-10-23T02:01:00+02:00", 100.002, 0.001),
             # A provider response must not overwrite this outside the requested day.
-            reading("2026-10-24T00:01:00+02:00", 999, 999),
+            reading("2026-10-24T01:01:00+02:00", 999, 999),
         ]
         await self.import_rows(partial_update, day, day + timedelta(days=1))
         self.assertEqual(len(self.ha_rows(day, "hour")), 3)
@@ -182,11 +184,11 @@ class CalendarViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fixture.database_rows(HOURLY_ID), before_repeat)
         self.assert_native_unchanged()
 
-    async def test_summer_midnight_keeps_current_provider_day_separate_from_future(self):
+    async def test_summer_midnight_reading_closes_previous_day_without_querying_future(self):
         now = datetime(2026, 7, 10, 0, 30, tzinfo=MADRID)
         provider_today = date(2026, 7, 9)
         hourly = [
-            reading("2026-07-02T23:01:00+01:00", 100.010, 0.010),
+            reading("2026-07-03T00:01:00+01:00", 100.010, 0.010),
             reading("2026-07-09T23:01:00+01:00", 100.025, 0.015),
         ]
         daily = [reading("2026-07-09T23:01:00+01:00", 100.025, 0.015)]
@@ -240,11 +242,11 @@ class CalendarViewTests(unittest.IsolatedAsyncioTestCase):
                 for request in calls
             )
         )
-        hours = self.ha_rows(date(2026, 7, 10), "hour")
+        hours = self.ha_rows(date(2026, 7, 9), "hour")
         self.assertEqual(len(hours), 1)
         self.assertEqual(
-            datetime.fromtimestamp(hours[0]["start"], UTC), datetime(2026, 7, 9, 22, tzinfo=UTC)
+            datetime.fromtimestamp(hours[0]["start"], UTC), datetime(2026, 7, 9, 21, tzinfo=UTC)
         )
         self.assertAlmostEqual(hours[0]["change"], 15)
-        self.assertAlmostEqual(self.ha_rows(date(2026, 7, 10), "day")[0]["change"], 15)
+        self.assertAlmostEqual(self.ha_rows(date(2026, 7, 9), "day")[0]["change"], 15)
         self.assert_native_unchanged()

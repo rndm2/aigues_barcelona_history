@@ -2,7 +2,8 @@
 
 DAILY timestamps identify provider calendar-day labels. Their supplied offset is
 retained for audit, but converting the instant must not move a daily aggregate
-into another labelled day. HOURLY timestamps identify actual measurement times.
+into another labelled day. HOURLY timestamps identify meter readings at the end
+of consumption intervals. HA statistic starts identify the preceding UTC hour.
 
 Each frequency has its own ledger. Mixing DAILY and HOURLY ledgers would count
 the same consumption twice and is the caller's responsibility to prevent.
@@ -17,6 +18,7 @@ from enum import Enum
 import math
 
 UTC = datetime_timezone.utc
+HOURLY_INTERVAL = timedelta(hours=1)
 
 
 class Frequency(str, Enum):
@@ -114,7 +116,7 @@ def canonical_start(observed_at: datetime, frequency, timezone: tzinfo):
         raise ValueError("Observation must be a datetime with an offset")
     if frequency is Frequency.DAILY:
         return _start_of_local_day(observed_at.date(), timezone)
-    return observed_at.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+    return observed_at.astimezone(UTC).replace(minute=0, second=0, microsecond=0) - HOURLY_INTERVAL
 
 
 def _in_window(observed_at, frequency, timezone, startdate, enddate):
@@ -133,9 +135,10 @@ def normalize_readings(raw, frequency, timezone: tzinfo, *, startdate=None, endd
     """Return a serialized ledger of validated, independently reported intervals.
 
     DAILY uses the provider's date label at midnight in the supplied business
-    timezone. HOURLY preserves the supplied offset and floors the actual UTC
-    instant. A later observation replaces an older observation in the same
-    interval. An identical observation with conflicting values is rejected.
+    timezone. HOURLY preserves the supplied offset and assigns the consumption
+    ending at a reading to the preceding UTC hour. A later observation replaces
+    an older observation in the same interval. An identical observation with
+    conflicting values is rejected.
     Optional bounds select a half-open range of HA dates for HOURLY, or
     provider calendar-date labels for the separate DAILY reference.
     Every row is validated before filtering, while out-of-range rows cannot
@@ -213,6 +216,26 @@ def validate_saved_ledger(ledger, frequency, timezone: tzinfo):
                 f"Stored {frequency.value} interval start does not match its observation"
             )
     return canonical
+
+
+def migrate_legacy_hourly_ledger(ledger, timezone: tzinfo):
+    """Rekey validated reading-time buckets as consumption-interval starts.
+
+    Legacy data floored the reading instant, placing its preceding consumption
+    one actual hour late. The UTC translation is bijective through DST changes.
+    Original observations, readings and deltas remain unchanged. Reject a mixed
+    or damaged ledger rather than applying another shift to corrected records.
+    """
+    canonical = merge_ledgers(ledger)
+    migrated = {}
+    for record in canonical.values():
+        observed_at = _aware_datetime(record["observed_at"], "observed_at")
+        start = canonical_start(observed_at, Frequency.HOURLY, timezone)
+        if _aware_datetime(record["start"], "start") != start + HOURLY_INTERVAL:
+            raise ValueError("Stored legacy HOURLY start does not match its reading time")
+        updated = {**record, "start": start.isoformat()}
+        _insert(migrated, updated)
+    return validate_saved_ledger(migrated, Frequency.HOURLY, timezone)
 
 
 def reconcile_intervals(current, incoming, frequency, timezone, *, startdate, enddate):

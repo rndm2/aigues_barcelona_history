@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.4 — 2026-10-30
+
+- Assign hourly consumption to the interval preceding its meter reading, retaining the API offset and both daylight-saving folds.
+- Fetch the following boundary reading when it is needed to complete a requested HA day.
+- Repair saved hourly buckets and their recorder statistics once, with a durable replay marker and verified readback.
+- Preserve all source amounts, missing hours, daily references and the original integration.
+- Document why a provider daily report can use different boundaries from a civil HA day.
+
 ## 0.4.3 — 2026-10-30
 
 - Reuse a server-validated, unexpired session for the same account before a background update buys another login.

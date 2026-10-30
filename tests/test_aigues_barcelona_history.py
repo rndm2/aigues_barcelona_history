@@ -198,7 +198,12 @@ class CoordinatorLedgerTests(OfflineTests):
         store = self.coordinator._store
         store.async_load.assert_awaited_once_with()
         store.async_save.assert_awaited_once()
-        self.assertEqual(set(store.saved), {"DAILY", "HOURLY"})
+        self.assertEqual(
+            set(store.saved),
+            {"DAILY", "HOURLY", "hourly_interval_version", "hourly_replay_pending"},
+        )
+        self.assertEqual(store.saved["hourly_interval_version"], 2)
+        self.assertFalse(store.saved["hourly_replay_pending"])
         self.assertEqual(len(store.saved["DAILY"]), 1)
         row = next(iter(store.saved["DAILY"].values()))
         self.assertEqual((row["delta"], row["state"]), (1.478, 655.724))
@@ -420,8 +425,7 @@ class RefreshAndManualImportTests(OfflineTests):
         self.assertEqual(
             hourly,
             [
-                call(date(2026, 10, 21), date(2026, 10, 28), CONTRACT, frequency="HOURLY"),
-                call(date(2026, 10, 28), date(2026, 10, 29), CONTRACT, frequency="HOURLY"),
+                call(date(2026, 10, 22), date(2026, 10, 29), CONTRACT, frequency="HOURLY"),
                 call(date(2026, 10, 29), date(2026, 10, 30), CONTRACT, frequency="HOURLY"),
             ],
         )

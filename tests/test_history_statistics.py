@@ -52,7 +52,7 @@ class LedgerTests(unittest.TestCase):
         self.assertAlmostEqual(points[1]["sum"] - points[0]["sum"], 0.010)
         self.assertEqual(
             [point["start"] for point in points],
-            [datetime(2026, 10, 27, 0, tzinfo=UTC), datetime(2026, 10, 28, 1, tzinfo=UTC)],
+            [datetime(2026, 10, 26, 23, tzinfo=UTC), datetime(2026, 10, 28, 0, tzinfo=UTC)],
         )
 
     def test_backfill_and_correction_rebuild_later_sums_without_repeat_drift(self):
@@ -136,8 +136,8 @@ class LedgerTests(unittest.TestCase):
     def test_repeated_fall_back_hour_remains_two_actual_utc_hours(self):
         ledger = normalize(
             [
-                reading("2026-10-25T02:15:00+01:00", 100.3, 0.2),
-                reading("2026-10-25T02:15:00+02:00", 100.1, 0.1),
+                reading("2026-10-25T03:15:00+01:00", 100.3, 0.2),
+                reading("2026-10-25T02:15:00+01:00", 100.1, 0.1),
             ]
         )
         points = statistics.build_statistics(ledger)
@@ -227,7 +227,9 @@ class HourlyCoverageTests(unittest.TestCase):
         return normalize(
             [
                 reading(
-                    (start + timedelta(hours=hour, minutes=1)).isoformat(), 100 + hour / 100, 0.01
+                    (start + timedelta(hours=hour + 1, minutes=1)).isoformat(),
+                    100 + hour / 100,
+                    0.01,
                 )
                 for hour in range(count)
             ]
@@ -282,8 +284,8 @@ class HourlyCoverageTests(unittest.TestCase):
     def test_partial_edges_are_listed_but_complete_middle_days_are_compact(self):
         ledger = normalize(
             [
-                reading("2026-10-26T22:01:00Z", 100, 0),
-                reading("2026-10-28T00:01:00Z", 101, 0.1),
+                reading("2026-10-26T23:01:00Z", 100, 0),
+                reading("2026-10-28T01:01:00Z", 101, 0.1),
             ]
         )
         full_middle = self.reported_hours(datetime(2026, 10, 26, 23, tzinfo=UTC), 24)
@@ -303,8 +305,8 @@ class HourlyCoverageTests(unittest.TestCase):
 
     def test_whole_missing_dates_remain_visible_including_dst_length(self):
         cases = (
-            ("2026-03-27T23:01:00Z", "2026-03-29T22:01:00Z", "2026-03-29", 23, 71),
-            ("2026-10-23T22:01:00Z", "2026-10-25T23:01:00Z", "2026-10-25", 25, 73),
+            ("2026-03-28T00:01:00Z", "2026-03-29T23:01:00Z", "2026-03-29", 23, 71),
+            ("2026-10-23T23:01:00Z", "2026-10-26T00:01:00Z", "2026-10-25", 25, 73),
         )
         for first, last, missing_day, hours, total in cases:
             with self.subTest(missing_day=missing_day):
@@ -323,7 +325,7 @@ class HourlyCoverageTests(unittest.TestCase):
                 self.assertEqual(len(coverage["incomplete_days"]), 3)
 
     def test_local_date_is_derived_from_the_actual_hour_not_its_utc_date(self):
-        ledger = normalize([reading("2026-10-26T23:01:00Z", 100, 0)])
+        ledger = normalize([reading("2026-10-27T00:01:00Z", 100, 0)])
         coverage = statistics.describe_hourly_coverage(ledger, MADRID)
         self.assertEqual(
             coverage["incomplete_days"],

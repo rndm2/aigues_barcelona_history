@@ -136,15 +136,15 @@ class CanonicalCalendarCoordinatorTests(OfflineTests):
         source = self.coordinator._store.saved["HOURLY"]
         self.assertEqual(len(source), 5, "Only one newly reported hour is added")
         for key in (
-            "2026-10-26T11:00:00+00:00",
-            "2026-10-27T11:00:00+00:00",
-            "2026-10-28T11:00:00+00:00",
+            "2026-10-26T10:00:00+00:00",
+            "2026-10-27T10:00:00+00:00",
+            "2026-10-28T10:00:00+00:00",
         ):
             self.assertEqual(source[key], source_before[key])
         self.assertEqual(
-            source["2026-10-27T09:00:00+00:00"]["observed_at"], "2026-10-27T10:05:00+01:00"
+            source["2026-10-27T08:00:00+00:00"]["observed_at"], "2026-10-27T10:05:00+01:00"
         )
-        self.assertEqual(source["2026-10-27T09:00:00+00:00"]["delta"], 0.25)
+        self.assertEqual(source["2026-10-27T08:00:00+00:00"]["delta"], 0.25)
         rows = [self.recorded[HOURLY_ID][key] for key in sorted(self.recorded[HOURLY_ID])]
         self.assertEqual([row["sum"] for row in rows], [0.1, 0.35, 0.4, 0.7, 1.1])
         previous = 0
@@ -154,7 +154,7 @@ class CanonicalCalendarCoordinatorTests(OfflineTests):
             previous = row["sum"]
         for actual, expected in zip(changes, (0.1, 0.25, 0.05, 0.3, 0.4)):
             self.assertAlmostEqual(actual, expected)
-        outside_after = datetime.fromisoformat("2026-10-28T11:00:00+00:00").timestamp()
+        outside_after = datetime.fromisoformat("2026-10-28T10:00:00+00:00").timestamp()
         self.assertEqual(rows_before[outside_after]["sum"], 1.0)
         self.assertEqual(self.recorded[HOURLY_ID][outside_after]["sum"], 1.1)
         self.assertEqual(self.recorded[HOURLY_ID][outside_after]["state"], 101.0)
@@ -184,11 +184,11 @@ class CanonicalCalendarCoordinatorTests(OfflineTests):
         self.assertEqual(self.coordinator._store.saved, before)
         self.queue.async_import_statistics.assert_not_called()
 
-    async def test_hourly_fetch_pads_provider_date_and_splits_today_before_ha_filtering(self):
+    async def test_hourly_fetch_covers_reading_endpoints_and_splits_today_before_ha_filtering(self):
         raw = [
             reading("2026-10-16T21:01:00+01:00", 100, 0.1),
-            # Fixed-CET date 16 belongs to Madrid's summer calendar date 17.
-            reading("2026-10-16T23:01:00+01:00", 100.2, 0.2),
+            # At 01:01 Madrid this reading closes the first hour of the 17th.
+            reading("2026-10-17T00:01:00+01:00", 100.2, 0.2),
             reading("2026-10-29T12:01:00+01:00", 101.3, 0.3),
             reading("2026-10-30T00:01:00+01:00", 101.7, 0.4),
         ]
@@ -205,8 +205,8 @@ class CanonicalCalendarCoordinatorTests(OfflineTests):
         self.assertEqual(
             self.coordinator._api.consumptions.call_args_list,
             [
-                call(date(2026, 10, 16), date(2026, 10, 23), CONTRACT, frequency="HOURLY"),
-                call(date(2026, 10, 23), date(2026, 10, 29), CONTRACT, frequency="HOURLY"),
+                call(date(2026, 10, 17), date(2026, 10, 24), CONTRACT, frequency="HOURLY"),
+                call(date(2026, 10, 24), date(2026, 10, 29), CONTRACT, frequency="HOURLY"),
                 call(date(2026, 10, 29), date(2026, 10, 30), CONTRACT, frequency="HOURLY"),
             ],
         )
@@ -214,11 +214,11 @@ class CanonicalCalendarCoordinatorTests(OfflineTests):
             list(sorted(fetched)),
             [
                 "2026-10-16T22:00:00+00:00",
-                "2026-10-29T11:00:00+00:00",
+                "2026-10-29T10:00:00+00:00",
             ],
         )
         self.assertEqual(fetched["2026-10-16T22:00:00+00:00"]["delta"], 0.2)
-        self.assertEqual(fetched["2026-10-29T11:00:00+00:00"]["delta"], 0.3)
+        self.assertEqual(fetched["2026-10-29T10:00:00+00:00"]["delta"], 0.3)
 
     async def test_daily_reference_fetch_has_exact_labels_without_hourly_padding(self):
         await self.coordinator._fetch(date(2026, 10, 17), date(2026, 10, 30), Frequency.DAILY)

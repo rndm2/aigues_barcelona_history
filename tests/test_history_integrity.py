@@ -45,8 +45,8 @@ UTC = timezone.utc
 class IntervalIntegrityTests(unittest.TestCase):
     def test_hourly_bounds_exclude_the_next_ha_calendar_day(self):
         rows = [
-            reading("2026-10-28T23:30:00+01:00", 10, 0.1),
-            reading("2026-10-29T00:45:00+01:00", 11, 0.2),
+            reading("2026-10-29T00:30:00+01:00", 10, 0.1),
+            reading("2026-10-29T01:45:00+01:00", 11, 0.2),
         ]
         ledger = normalize_readings(
             rows,
@@ -70,7 +70,7 @@ class IntervalIntegrityTests(unittest.TestCase):
                 enddate=date(2026, 10, 29),
             )
 
-    def test_bounds_are_half_open_provider_dates_for_both_frequencies(self):
+    def test_bounds_use_provider_labels_for_daily_and_interval_dates_for_hourly(self):
         rows = [
             reading("2026-10-27T23:55:00+01:00", 10, 0.1),
             reading("2026-10-28T00:05:00+01:00", 11, 0.2),
@@ -91,8 +91,8 @@ class IntervalIntegrityTests(unittest.TestCase):
                     {"2026-10-28T23:55:00+01:00"}
                     if frequency is Frequency.DAILY
                     else {
-                        "2026-10-28T00:05:00+01:00",
                         "2026-10-28T23:55:00+01:00",
+                        "2026-10-29T00:05:00+01:00",
                     },
                 )
 
@@ -126,14 +126,14 @@ class IntervalIntegrityTests(unittest.TestCase):
             [reading("2026-10-28T10:01:00Z", 10, 0.1)], Frequency.HOURLY, MADRID
         )
         row = next(iter(ledger.values()))
-        aliased = {"2026-10-28T10:00:00Z": {**row, "start": "2026-10-28T10:00:00Z"}}
+        aliased = {"2026-10-28T09:00:00Z": {**row, "start": "2026-10-28T09:00:00Z"}}
         self.assertEqual(validate_saved_ledger(aliased, Frequency.HOURLY, MADRID), ledger)
 
     def test_one_canonical_rule_retains_both_autumn_hours(self):
         self.assertEqual(
             [
                 canonical_start(datetime.fromisoformat(timestamp), Frequency.HOURLY, MADRID)
-                for timestamp in ("2026-10-25T02:15:00+02:00", "2026-10-25T02:15:00+01:00")
+                for timestamp in ("2026-10-25T02:15:00+01:00", "2026-10-25T03:15:00+01:00")
             ],
             [datetime(2026, 10, 25, 0, tzinfo=UTC), datetime(2026, 10, 25, 1, tzinfo=UTC)],
         )
@@ -243,8 +243,8 @@ class CoordinatorIntegrityTests(OfflineTests):
 
     async def test_fetch_filters_padded_responses_to_requested_ha_dates(self):
         self.coordinator._api.consumptions.return_value = [
-            reading("2026-10-28T23:30:00+01:00", 10, 0.1),
-            reading("2026-10-29T00:45:00+01:00", 11, 0.2),
+            reading("2026-10-29T00:30:00+01:00", 10, 0.1),
+            reading("2026-10-29T01:45:00+01:00", 11, 0.2),
         ]
         rows = await self.coordinator._fetch(
             date(2026, 10, 28), date(2026, 10, 29), Frequency.HOURLY
@@ -349,12 +349,12 @@ class RecorderSQLiteIntegrityTests(OfflineTests):
         self.assertEqual(
             rows,
             [
-                (datetime(2026, 10, 27, 9, tzinfo=UTC).timestamp(), 100, 0.2),
-                (datetime(2026, 10, 28, 15, tzinfo=UTC).timestamp(), 102, 0.5),
+                (datetime(2026, 10, 27, 8, tzinfo=UTC).timestamp(), 100, 0.2),
+                (datetime(2026, 10, 28, 14, tzinfo=UTC).timestamp(), 102, 0.5),
             ],
         )
         self.assertEqual([row["change"] for row in self.actual_ha_changes(HOURLY_ID)], [0.2, 0.3])
-        after_gap = self.actual_ha_changes(HOURLY_ID, start=datetime(2026, 10, 28, 15, tzinfo=UTC))
+        after_gap = self.actual_ha_changes(HOURLY_ID, start=datetime(2026, 10, 28, 14, tzinfo=UTC))
         self.assertEqual([row["change"] for row in after_gap], [0.3])
         self.assertEqual(self.database_rows(self.old_id), self.old_snapshot)
 
