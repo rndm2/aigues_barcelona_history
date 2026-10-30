@@ -48,3 +48,30 @@ reset_and_refresh_data:
   description: >-
     Legacy name for the same import action. Saved history is kept.
   fields: *history_import_fields
+
+import_hourly_date_range:
+  name: "Aigües Barcelona History: import hourly date range"
+  description: >-
+    Request reported hours for Aigües reporting dates, both included.
+    These are the dates selected in the Aigües hourly chart.
+    Existing saved history is kept. Select the same dates on the contract's
+    device page to use its Import hourly date range button.
+  fields:
+    contract:
+      name: Contract
+      description: Contract number. Required when multiple contracts are configured.
+      required: false
+      selector:
+        text:
+    start_date:
+      name: From date
+      description: First Aigües reporting date to request, included.
+      required: true
+      selector:
+        date:
+    end_date:
+      name: To date
+      description: Last Aigües reporting date to request, included. Cannot be in the future.
+      required: true
+      selector:
+        date:

@@ -151,6 +151,87 @@ def _validate_bounds(startdate, enddate, *, optional=False):
         raise ValueError("Window end precedes its start")
 
 
+def _canonical_iso_date(value, field):
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a canonical ISO calendar date")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"{field} must be a canonical ISO calendar date") from error
+    if parsed.isoformat() != value:
+        raise ValueError(f"{field} must be a canonical ISO calendar date")
+    return parsed
+
+
+def validate_hourly_import_range(start, end_inclusive, *, today_provider, max_days):
+    """Validate an inclusive manual provider-date request without reading a clock.
+
+    UI date selectors return canonical ISO strings; service callers may supply
+    actual calendar dates. Datetimes are never silently truncated. The caller
+    supplies the shared configured request limit, while the age of an otherwise
+    valid historical range is unrestricted. Return half-open calendar bounds.
+    """
+    _validate_bounds(today_provider, today_provider)
+    if isinstance(max_days, bool) or not isinstance(max_days, int) or max_days < 1:
+        raise ValueError("The hourly request limit must be a positive number of days")
+    bounds = [
+        _canonical_iso_date(value, field) if isinstance(value, str) else value
+        for value, field in ((start, "Start date"), (end_inclusive, "End date"))
+    ]
+    start, end_inclusive = bounds
+    _validate_bounds(start, end_inclusive)
+    if end_inclusive > today_provider:
+        raise ValueError("Hourly import dates cannot be in the future")
+    if (end_inclusive - start).days + 1 > max_days:
+        raise ValueError("The hourly import range exceeds the request limit")
+    try:
+        end = end_inclusive + timedelta(days=1)
+    except OverflowError as error:
+        raise ValueError(
+            "The hourly import end cannot be represented as an exclusive date"
+        ) from error
+    return start, end
+
+
+def validate_hourly_requested_ranges(ranges):
+    """Validate durable provider-date intent and return its canonical interval union.
+
+    Entries use canonical ISO strings and half-open bounds. Overlapping or
+    adjacent requests merge, retaining all requested dates without mutating the
+    input. A union may exceed one manual request's limit because it represents
+    several separately validated requests, not a larger single API operation.
+    """
+    if not isinstance(ranges, (list, tuple)):
+        raise ValueError("Hourly requested ranges must be a list of date intervals")
+    intervals = []
+    for item in ranges:
+        if not isinstance(item, Mapping) or set(item) != {"start", "end"}:
+            raise ValueError("Each hourly requested range must contain only start and end")
+        start = _canonical_iso_date(item["start"], "Requested range start")
+        end = _canonical_iso_date(item["end"], "Requested range end")
+        if start >= end:
+            raise ValueError("Requested hourly ranges must have a positive half-open span")
+        intervals.append((start, end))
+    merged = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = merged[-1][0], max(merged[-1][1], end)
+        else:
+            merged.append((start, end))
+    return [{"start": start.isoformat(), "end": end.isoformat()} for start, end in merged]
+
+
+def add_hourly_requested_range(ranges, start, end):
+    """Add one validated half-open provider interval to durable request intent."""
+    _validate_bounds(start, end)
+    return validate_hourly_requested_ranges(
+        [
+            *validate_hourly_requested_ranges(ranges),
+            {"start": start.isoformat(), "end": end.isoformat()},
+        ]
+    )
+
+
 def _start_of_local_day(day: date, timezone: tzinfo) -> datetime:
     """Return one shared local-midnight boundary as an actual UTC instant."""
     return datetime.combine(day, time.min, tzinfo=timezone).astimezone(UTC)
@@ -177,20 +258,39 @@ def canonical_start(observed_at: datetime, frequency, timezone: tzinfo):
     return observed_at.astimezone(UTC).replace(minute=0, second=0, microsecond=0) - HOURLY_INTERVAL
 
 
-def _in_window(observed_at, frequency, timezone, startdate, enddate):
-    """Use HA calendar dates for hours and provider labels for daily references."""
-    interval_date = (
-        observed_at.date()
-        if frequency is Frequency.DAILY
-        else canonical_start(observed_at, frequency, timezone).astimezone(timezone).date()
-    )
+def _validate_provider_dates(frequency, provider_dates):
+    if not isinstance(provider_dates, bool):
+        raise ValueError("The provider-date scope flag must be a boolean")
+    if provider_dates and frequency is not Frequency.HOURLY:
+        raise ValueError("A provider-date scope is only valid for HOURLY readings")
+
+
+def _in_window(observed_at, frequency, timezone, startdate, enddate, provider_dates=False):
+    """Share the requested scope between raw normalization and durable reconciliation."""
+    if startdate is None and enddate is None:
+        return True
+    if frequency is Frequency.DAILY:
+        interval_date = observed_at.date()
+    elif provider_dates:
+        interval_date = _provider_date(observed_at)
+    else:
+        interval_date = (
+            canonical_start(observed_at, frequency, timezone).astimezone(timezone).date()
+        )
     return (startdate is None or interval_date >= startdate) and (
         enddate is None or interval_date < enddate
     )
 
 
 def normalize_readings(
-    raw, frequency, timezone: tzinfo, *, startdate=None, enddate=None, provider_date=None
+    raw,
+    frequency,
+    timezone: tzinfo,
+    *,
+    startdate=None,
+    enddate=None,
+    provider_date=None,
+    provider_dates=False,
 ):
     """Return a serialized ledger of validated, independently reported intervals.
 
@@ -201,6 +301,8 @@ def normalize_readings(
     conflicting values is rejected.
     Optional bounds select a half-open range of HA dates for HOURLY, or
     provider calendar-date labels for the separate DAILY reference.
+    ``provider_dates=True`` selects hourly bounds by the actual fixed-CET date
+    of each closing reading instead of its preceding HA consumption date.
     An optional HOURLY provider date selects one complete fixed-CET closing
     block, including its actual intervals on the preceding HA date in winter.
     Every row is validated before filtering, while out-of-range rows cannot
@@ -210,6 +312,7 @@ def normalize_readings(
     if not isinstance(timezone, tzinfo):
         raise ValueError("A timezone is required")
     _validate_bounds(startdate, enddate, optional=True)
+    _validate_provider_dates(frequency, provider_dates)
     _validate_bounds(provider_date, provider_date, optional=True)
     if provider_date is not None and frequency is not Frequency.HOURLY:
         raise ValueError("A provider-date filter is only valid for HOURLY readings")
@@ -233,10 +336,34 @@ def normalize_readings(
         )
         if provider_date is not None and _provider_date(observed_at) != provider_date:
             continue
-        if not _in_window(observed_at, frequency, timezone, startdate, enddate):
+        if not _in_window(observed_at, frequency, timezone, startdate, enddate, provider_dates):
             continue
         _insert(ledger, record)
     return ledger
+
+
+def _validated_ledger_records(ledger):
+    """Validate each serialized row once before callers consolidate or filter it."""
+    if not isinstance(ledger, Mapping):
+        raise ValueError("Each ledger must be a mapping")
+    for key, value in ledger.items():
+        if not isinstance(value, Mapping):
+            raise ValueError("Each ledger entry must be a mapping")
+        try:
+            start = _aware_datetime(value["start"], "start")
+            observed_at = _aware_datetime(value["observed_at"], "observed_at")
+            record = _record(
+                start,
+                observed_at,
+                value["state"],
+                value["delta"],
+                origin=value.get("origin", _MISSING),
+            )
+        except KeyError as error:
+            raise ValueError(f"Ledger entry is missing {error.args[0]}") from error
+        if _aware_datetime(key, "ledger key").astimezone(UTC) != start:
+            raise ValueError("Ledger key does not match its interval start")
+        yield record
 
 
 def merge_ledgers(*ledgers):
@@ -249,39 +376,25 @@ def merge_ledgers(*ledgers):
     """
     merged = {}
     for ledger in ledgers:
-        if not isinstance(ledger, Mapping):
-            raise ValueError("Each ledger must be a mapping")
         snapshot = {}
-        for key, value in ledger.items():
-            if not isinstance(value, Mapping):
-                raise ValueError("Each ledger entry must be a mapping")
-            try:
-                start = _aware_datetime(value["start"], "start")
-                observed_at = _aware_datetime(value["observed_at"], "observed_at")
-                record = _record(
-                    start,
-                    observed_at,
-                    value["state"],
-                    value["delta"],
-                    origin=value.get("origin", _MISSING),
-                )
-            except KeyError as error:
-                raise ValueError(f"Ledger entry is missing {error.args[0]}") from error
-            if _aware_datetime(key, "ledger key").astimezone(UTC) != start:
-                raise ValueError("Ledger key does not match its interval start")
+        for record in _validated_ledger_records(ledger):
             _insert(snapshot, record)
         for record in snapshot.values():
             _insert(merged, record, allow_correction=True)
     return merged
 
 
-def validate_saved_ledger(ledger, frequency, timezone: tzinfo):
-    """Reject valid-looking stored records assigned to another interval or series."""
+def validate_saved_ledger(
+    ledger, frequency, timezone: tzinfo, *, startdate=None, enddate=None, provider_dates=False
+):
+    """Validate every source row, then consolidate only requested source intervals."""
     frequency = _frequency(frequency)
     if not isinstance(timezone, tzinfo):
         raise ValueError("A timezone is required")
-    canonical = merge_ledgers(ledger)
-    for record in canonical.values():
+    _validate_bounds(startdate, enddate, optional=True)
+    _validate_provider_dates(frequency, provider_dates)
+    canonical = {}
+    for record in _validated_ledger_records(ledger):
         observed_at = _aware_datetime(record["observed_at"], "observed_at")
         if "origin" in record:
             native_day = (
@@ -301,6 +414,8 @@ def validate_saved_ledger(ledger, frequency, timezone: tzinfo):
             raise ValueError(
                 f"Stored {frequency.value} interval start does not match its observation"
             )
+        if _in_window(observed_at, frequency, timezone, startdate, enddate, provider_dates):
+            _insert(canonical, record)
     return canonical
 
 
@@ -324,23 +439,30 @@ def migrate_legacy_hourly_ledger(ledger, timezone: tzinfo):
     return validate_saved_ledger(migrated, Frequency.HOURLY, timezone)
 
 
-def reconcile_intervals(current, incoming, frequency, timezone, *, startdate, enddate):
+def reconcile_intervals(
+    current, incoming, frequency, timezone, *, startdate, enddate, provider_dates=False
+):
     """Apply only returned intervals inside the requested calendar range.
 
     A later fetch is authoritative for an existing HOURLY interval, even if
     its observation minute moved backwards. DAILY references retain their
     latest observation. Missing response intervals never erase durable data.
     Later cumulative sums are rebuilt separately.
+    Hourly ``provider_dates=True`` uses the same fixed-CET closing-date scope
+    as normalization, including physical winter intervals on a preceding HA day.
     """
     frequency = _frequency(frequency)
     _validate_bounds(startdate, enddate)
+    _validate_provider_dates(frequency, provider_dates)
     result = validate_saved_ledger(current, frequency, timezone)
-    updates = validate_saved_ledger(incoming, frequency, timezone)
-    selected = {}
-    for key, record in updates.items():
-        observed_at = _aware_datetime(record["observed_at"], "observed_at")
-        if _in_window(observed_at, frequency, timezone, startdate, enddate):
-            selected[key] = record
+    selected = validate_saved_ledger(
+        incoming,
+        frequency,
+        timezone,
+        startdate=startdate,
+        enddate=enddate,
+        provider_dates=provider_dates,
+    )
     if frequency is Frequency.DAILY:
         return merge_ledgers(result, selected)
     return result | selected
@@ -506,7 +628,9 @@ def initial_energy_hourly_since(hourly, timezone):
     return min(complete or blocks, default=None)
 
 
-def pending_hourly_provider_days(daily, hourly, timezone, *, hourly_since, current_provider_date):
+def pending_hourly_provider_days(
+    daily, hourly, timezone, *, hourly_since, current_provider_date, requested_ranges=()
+):
     """Return every closed provider block still needing reported hours.
 
     A known partial hourly block remains eligible at any age, including before
@@ -514,17 +638,31 @@ def pending_hourly_provider_days(daily, hourly, timezone, *, hourly_since, curre
     only at or after that frontier. Ancient intentionally coarse daily history
     is therefore not expanded into an unbounded initial download. This list is
     independent of the Energy fallback policy and is never truncated for attrs.
+    Explicit manual request ranges retain their intent even when both source
+    ledgers returned nothing. Every closed incomplete requested date is eligible
+    at any age, including before the normal Energy detail frontier.
     """
     _validate_bounds(hourly_since, hourly_since, optional=True)
     _validate_bounds(current_provider_date, current_provider_date)
     reports = _daily_provider_reports(daily, timezone)
     blocks = _provider_hourly_blocks(hourly, timezone)
+    requested_days = set()
+    for interval in validate_hourly_requested_ranges(requested_ranges):
+        day = date.fromisoformat(interval["start"])
+        end = min(date.fromisoformat(interval["end"]), current_provider_date)
+        while day < end:
+            requested_days.add(day)
+            day += timedelta(days=1)
     return [
         day
-        for day in sorted(reports.keys() | blocks.keys())
+        for day in sorted(reports.keys() | blocks.keys() | requested_days)
         if day < current_provider_date
         and len(blocks.get(day, {})) < PROVIDER_DAY_HOURS
-        and (day in blocks or (hourly_since is not None and day >= hourly_since))
+        and (
+            day in requested_days
+            or day in blocks
+            or (hourly_since is not None and day >= hourly_since)
+        )
     ]
 
 

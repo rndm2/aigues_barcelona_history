@@ -90,6 +90,37 @@ The contract's History device provides:
 
 - **Import hourly history**: use its saved hourly range.
 - **Import daily reference**: use its saved daily range.
+- **Hourly import from** and **Hourly import to**: select reporting dates.
+- **Import hourly date range**: request the selected dates, both included.
+
+The manual date range uses the same dates as the **hourly day selector in the
+Aigües portal**. These are provider reporting dates, not the converted closing
+date printed on its daily chart. Returned readings retain their offsets and
+become actual preceding-hour intervals in HA. In winter, a provider day's first
+interval can therefore appear on the preceding HA calendar date.
+
+Select up to 1,825 dates per request. Dates in the future and reversed ranges
+are rejected. The two selections survive restarts and can be edited while an
+import runs; the running job retains the dates captured when it started.
+The requested range is saved before authentication or network requests. Even
+old dates with no daily report and no hourly rows remain queued after a valid
+empty response or a failed request. Complete provider blocks leave the retry
+queue. Multiple requested ranges are retained as a merged union, and do not
+change the saved initial-import flag or the separate daily reference.
+
+The same operation is available in **Developer tools → Actions**:
+
+```yaml
+action: aigues_barcelona_history.import_hourly_date_range
+data:
+  start_date: "2026-10-22"
+  end_date: "2026-10-28"
+```
+
+Add `contract: EXAMPLE123` when multiple contracts are configured. Initial
+requests share the existing five-attempt transient retry policy and provider
+retry pauses. Subsequent incomplete-day retries retain the two-attempt budget
+and age-based scheduling described below.
 
 Buttons preserve existing history and do not mark the other configured import
 complete. Their timestamp records the press, not proof of complete provider
@@ -103,8 +134,9 @@ allows at most two additional consumption GET attempts per meter, with the
 oldest actual attempt served first. Days aged 8–30 are eligible daily, 31–180
 weekly, and older days every 30 days. The attempt times survive restarts.
 
-The backlog includes every known partial hourly block and missing blocks within
-the detailed-history range. Older daily-only history remains compressed. A
+The backlog includes every known partial hourly block, missing blocks within
+the detailed-history range, and incomplete dates explicitly requested with the
+manual date range. Other older daily-only history remains compressed. A
 valid empty response keeps its day pending. Returned hours are merged and can
 correct saved values only within the requested provider date. An old request
 failure does not discard the already committed recent readings. Backlog calls

@@ -27,7 +27,7 @@ def coordinator(contract="test123", entry_id="history-entry"):
 
 
 class HistoryImportButtonTests(unittest.IsolatedAsyncioTestCase):
-    async def test_setup_creates_two_buttons_per_owned_contract_only(self):
+    async def test_setup_creates_three_buttons_per_owned_contract_only(self):
         owned_one = coordinator("one")
         owned_two = coordinator("two")
         another = coordinator("other", "another-entry")
@@ -49,9 +49,9 @@ class HistoryImportButtonTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(entry_id="history-entry", runtime_data=(owned_one, owned_two)),
             entities.extend,
         )
-        self.assertEqual(len(entities), 4)
+        self.assertEqual(len(entities), 6)
         self.assertEqual({entity.coordinator.id for entity in entities}, {"one", "two"})
-        self.assertEqual(len({entity.unique_id for entity in entities}), 4)
+        self.assertEqual(len({entity.unique_id for entity in entities}), 6)
         self.assertTrue(
             all(entity.entity_id.startswith(f"button.{DOMAIN}_") for entity in entities)
         )
