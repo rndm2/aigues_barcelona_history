@@ -62,6 +62,13 @@ credentials during normal updates. A confirmed session-limit error pauses
 automatic sign-in until successful recovery. Consumption GET retries do not
 repeat a login or purchase additional CAPTCHAs.
 
+During background updates, History checks for an unexpired session already
+configured by an Aigües integration for the same account before buying another
+login. The provider must confirm access to every configured History contract.
+History updates only its own entry, without changing or logging out the source
+session. Other integrations remain optional. If no usable session exists, a
+confirmed session-limit block still prevents another automatic paid login.
+
 ## Settings and buttons
 
 Setup asks for these settings after authentication. They are also available
@@ -174,7 +181,7 @@ omits recorded intervals blocks a partial-history rebase and requires recovery.
 Candidate source batches are validated before saving. After publication, recorder
 rows are read back and compared by timestamp, state and sum. Failed publication
 is replayed from durable source data on a later run. The two series are not one
-shared SQL transaction. Temporary GET failures retry up to five attempts, with
+shared SQL transaction. Temporary consumption GET failures retry up to five attempts, with
 1/2/4/8-second backoff and persisted provider Retry-After deadlines.
 Consumption requests are also spaced by at least one second across History
 meters. Longer provider pauses take precedence. Long imports check the token

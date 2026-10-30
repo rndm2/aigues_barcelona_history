@@ -89,6 +89,7 @@ def make_coordinator(store=None):
         async_add_executor_job=execute,
         config_entries=SimpleNamespace(
             async_get_entry=Mock(return_value=entry),
+            async_entries=Mock(return_value=[]),
             async_update_entry=Mock(side_effect=update_entry),
         ),
     )
@@ -110,6 +111,7 @@ def make_coordinator(store=None):
     coordinator.async_set_updated_data = Mock()
     coordinator.async_update_listeners = Mock()
     coordinator._api = Mock(spec=AiguesBarcelonaHistoryApiClient)
+    coordinator._api.is_token_expired.return_value = False
     coordinator._api.consumptions.return_value = []
     return coordinator
 

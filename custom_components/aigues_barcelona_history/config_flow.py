@@ -14,7 +14,7 @@ from requests.exceptions import RequestException
 from twocaptcha import api as captcha_api
 import voluptuous as vol
 
-from . import canonical_contracts, conflicting_contracts
+from . import conflicting_contracts
 from .api import (
     AiguesApiAuthError,
     AiguesApiError,
@@ -28,6 +28,14 @@ from .const import (
     CONF_RETRY_NOT_BEFORE,
     DOMAIN,
     NAME,
+)
+from .identity import (
+    canonical_account as _account,
+)
+from .identity import (
+    contracts_from_response,
+    contracts_include,
+    token_matches_account,
 )
 from .settings import (
     effective_settings,
@@ -55,11 +63,6 @@ REAUTH_CONFIG_SCHEMA = vol.Schema(
 TOKEN_SCHEMA = vol.Schema({vol.Required(CONF_TOKEN): cv.string})
 
 
-def _account(value: str) -> str:
-    """Use one account identity for validation, uniqueness and reauthentication."""
-    return value.strip().upper()
-
-
 def check_valid_nif(username: str) -> bool:
     """Accept the existing personal DNI/NIE account formats."""
     username = _account(username)
@@ -83,8 +86,7 @@ async def validate_credentials(hass: HomeAssistant, data: dict[str, Any]) -> dic
             raise InvalidAuth
         if token := raw_token.strip():
             api.set_token(token)
-            claimed_user = api._return_token_field("name")
-            if not isinstance(claimed_user, str) or _account(claimed_user) != username:
+            if not token_matches_account(api, username):
                 raise InvalidAuth
             # The claim is an identity hint; the authenticated GET below still
             # validates the token with the provider.
@@ -103,9 +105,7 @@ async def validate_credentials(hass: HomeAssistant, data: dict[str, Any]) -> dic
         token = api.get_token()
         if not token or not isinstance(contracts, list):
             raise CannotConnect
-        available = canonical_contracts(
-            row["contractDetail"]["contractNumber"] for row in contracts
-        )
+        available = contracts_from_response(contracts)
         if not available:
             raise NoContracts
         return {
@@ -263,9 +263,7 @@ class AiguesBarcelonaHistoryConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             self.stored_input = dict(data)
             info = await validate_credentials(self.hass, data)
             configured = self.entry.data[CONF_CONTRACT] if self.entry else info[CONF_CONTRACT]
-            if not set(canonical_contracts(configured)).issubset(
-                canonical_contracts(info[CONF_CONTRACT])
-            ):
+            if not contracts_include(info[CONF_CONTRACT], configured):
                 raise InvalidAuth
             if conflicting_contracts(
                 self.hass, configured, self.entry.entry_id if self.entry else None

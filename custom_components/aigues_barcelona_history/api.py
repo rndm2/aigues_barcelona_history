@@ -316,7 +316,12 @@ class AiguesBarcelonaHistoryApiClient:
                 r = self._query(path, query, body, headers, method="POST")
             except Exception as e:
                 self._set_captcha_cooldown(30)
-                _LOGGER.error("Login POST failed, setting cooldown (%s)", type(e).__name__)
+                if isinstance(e, AiguesApiSessionLimitError):
+                    _LOGGER.warning(
+                        "Provider session limit rejected login; new paid attempts are paused"
+                    )
+                else:
+                    _LOGGER.error("Login POST failed, setting cooldown (%s)", type(e).__name__)
                 raise
 
             _LOGGER.debug("Login POST completed with status %s", r.status_code)
