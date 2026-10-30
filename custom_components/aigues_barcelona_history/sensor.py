@@ -747,7 +747,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         roles = {
             Frequency.DAILY: "Provider daily totals (reference)",
             Frequency.HOURLY: "Water consumption (reported hours)",
-            ENERGY_SERIES: "Water consumption (all history)",
+            ENERGY_SERIES: "Water consumption",
         }
         return {
             "mean_type": 0,
@@ -780,6 +780,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             use_daily_totals_for_incomplete=effective_settings(self._entry())[
                 CONF_ENERGY_DAILY_FALLBACK
             ],
+            current_provider_date=dt_util.now().astimezone(PROVIDER_TIME_ZONE).date(),
         )
 
     async def _publish(self) -> None:

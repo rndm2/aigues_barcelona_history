@@ -57,7 +57,7 @@
           "history_days": "Number of past days to request for daily history, plus today. These totals remain separate from reported hours and provide older Energy history.",
           "scan_interval_minutes": "Recent consumption refreshes automatically at this interval. The configured histories can be requested separately with their import buttons.",
           "should_import_history": "Run both configured imports once after setup. This switches off after a successful import. Use the import buttons whenever you need to request data again.",
-          "energy_daily_fallback": "Energy can show one aggregate bar for a reported daily total when hours are incomplete. Disable this to keep partial recent hours instead. Older history remains daily."
+          "energy_daily_fallback": "For past days with incomplete hours, Energy can temporarily show one aggregate bar from the daily total. Today always uses reported hours. Disable this to keep partial recent hours while waiting for remaining readings. Older history remains daily."
         }
       }
     }
@@ -79,7 +79,7 @@
           "history_days": "Number of past days to request for daily history, plus today. These totals remain separate from reported hours and provide older Energy history.",
           "scan_interval_minutes": "Recent consumption refreshes automatically at this interval. The configured histories can be requested separately with their import buttons.",
           "should_import_history": "Run both configured imports once after saving. This switches off after a successful import. Completed imports do not repeat on every restart. You can use the import buttons later.",
-          "energy_daily_fallback": "Energy can show one aggregate bar for a reported daily total when hours are incomplete. Disable this to keep partial recent hours instead. Older history remains daily."
+          "energy_daily_fallback": "For past days with incomplete hours, Energy can temporarily show one aggregate bar from the daily total. Today always uses reported hours. Disable this to keep partial recent hours while waiting for remaining readings. Older history remains daily."
         }
       }
     },

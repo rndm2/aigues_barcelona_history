@@ -491,6 +491,7 @@ def build_energy_projection(
     *,
     hourly_since,
     use_daily_totals_for_incomplete=True,
+    current_provider_date=None,
 ):
     """Select actual hours or one explicitly coarse total per provider block.
 
@@ -498,10 +499,13 @@ def build_energy_projection(
     block always uses its actual hours, even before the persisted frontier.
     Otherwise a daily report can replace the entire incomplete block, never
     coexist with its partial hours or distribute a residual across invented
-    hours. With the optional policy disabled, recent partial blocks retain
-    their actual hours; old partial blocks and days without any hours still
-    use available daily reports. A daily amount below known hourly consumption
-    is contradictory, so actual hours win and the disagreement is exposed.
+    hours. Current and future provider blocks always retain only actual hours.
+    With the optional policy disabled, recent incomplete blocks wait for their
+    reported hours, even when none have arrived yet. Only dates before the fixed
+    frontier (or without a frontier) can then use past daily reports. A daily
+    amount below known hourly consumption is contradictory, so actual hours win
+    and the disagreement is exposed. Without a current provider date all supplied
+    dates are treated as closed; the caller supplies the date without clock I/O.
 
     Coarse dates describe provider reporting periods, not measured hourly use.
     Their physical block boundaries remain fixed CET through Madrid DST. This
@@ -509,6 +513,7 @@ def build_energy_projection(
     is a derived ledger for ``build_statistics``, not a new HOURLY source ledger.
     """
     _validate_bounds(hourly_since, hourly_since, optional=True)
+    _validate_bounds(current_provider_date, current_provider_date, optional=True)
     if not isinstance(use_daily_totals_for_incomplete, bool):
         raise ValueError("The incomplete-day policy must be a boolean")
     daily = validate_saved_ledger(daily, Frequency.DAILY, timezone)
@@ -521,17 +526,37 @@ def build_energy_projection(
     coverage = {
         "hourly_since": hourly_since.isoformat() if hourly_since is not None else None,
         "use_daily_totals_for_incomplete": use_daily_totals_for_incomplete,
+        "current_provider_date": (
+            current_provider_date.isoformat() if current_provider_date is not None else None
+        ),
         "daily_aggregate_dates": [],
         "reported_hours": 0,
         "suppressed_reported_hours": 0,
         "complete_hourly_blocks": 0,
         "incomplete_provider_dates": {},
         "disagreement_dates": [],
+        "pending_provider_dates": [],
+        "updating_provider_day": None,
+        "updating_reported_hours": 0,
+        "updating_provider_day_complete": False,
     }
     for day in sorted(daily_by_day.keys() | blocks.keys()):
         hours = blocks.get(day, {})
         complete = len(hours) == PROVIDER_DAY_HOURS
         coverage["complete_hourly_blocks"] += int(complete)
+        closed = current_provider_date is None or day < current_provider_date
+        if day == current_provider_date:
+            coverage["updating_provider_day"] = day.isoformat()
+            coverage["updating_reported_hours"] = len(hours)
+            coverage["updating_provider_day_complete"] = complete
+        if (
+            closed
+            and not complete
+            and not use_daily_totals_for_incomplete
+            and hourly_since is not None
+            and day >= hourly_since
+        ):
+            coverage["pending_provider_dates"].append(day.isoformat())
         report = daily_by_day.get(day)
         known_amount = sum((Decimal(str(row["delta"])) for row in hours.values()), Decimal(0))
         daily_amount = Decimal(str(report["delta"])) if report is not None else None
@@ -542,11 +567,8 @@ def build_energy_projection(
             report is not None
             and not complete
             and not contradicts_known
-            and (
-                not hours
-                or use_daily_totals_for_incomplete
-                or (hourly_since is not None and day < hourly_since)
-            )
+            and closed
+            and (use_daily_totals_for_incomplete or hourly_since is None or day < hourly_since)
         )
         if hours and not complete:
             coverage["incomplete_provider_dates"][day.isoformat()] = {
@@ -573,7 +595,8 @@ def build_energy_projection(
     coverage["last_daily_aggregate_date"] = aggregate_dates[-1] if aggregate_dates else None
     coverage["incomplete_provider_days"] = len(coverage["incomplete_provider_dates"])
     coverage["disagreement_days"] = len(coverage["disagreement_dates"])
-    for key in ("daily_aggregate_dates", "disagreement_dates"):
+    coverage["pending_provider_days"] = len(coverage["pending_provider_dates"])
+    for key in ("daily_aggregate_dates", "disagreement_dates", "pending_provider_dates"):
         coverage[key] = coverage[key][-ENERGY_COVERAGE_RECENT_DATES:]
     coverage["incomplete_provider_dates"] = dict(
         list(coverage["incomplete_provider_dates"].items())[-ENERGY_COVERAGE_RECENT_DATES:]

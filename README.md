@@ -117,7 +117,7 @@ For example contract `EXAMPLE123`:
 | Canonical consumption | `aigues_barcelona_history:example123_hourly_consumption` |
 | Provider daily reference | `aigues_barcelona_history:example123_consumption` |
 
-Select **Water consumption (all history)** as the single Energy water source for
+Select **Water consumption** as the single Energy water source for
 the meter. It retains older daily history and uses actual hours for complete
 provider reporting blocks. Do not also select the source-only statistics or
 another integration for the same meter, because Energy would add them again.
@@ -128,12 +128,17 @@ duration field: opening an old date in hourly mode shows its entire daily total
 as one aggregate bar, not measured consumption during that hour. History never
 distributes it across 24 invented hours.
 
-By default, an incomplete provider block can also use its daily total while
-waiting for complete actual hours. Disable **Use daily totals when hours are
-incomplete** to keep partial recent hours and their incomplete totals. The detail
+The current provider day always uses its reported hours and fills as more arrive.
+By default, an incomplete past provider block can temporarily use its daily total
+while waiting for complete actual hours. Disable **Use daily totals when hours
+are incomplete** to keep partial recent hours and their incomplete totals. The detail
 boundary is saved once, so an isolated older backfill cannot erase daily history
 between it and the recent data. Complete older blocks can independently upgrade
-to actual hours. Available daily reports still cover dates with no hours.
+to actual hours. Available daily reports cover the older history even without hours.
+Regular polling revisits recent incomplete days and accepts newly returned hours
+and corrections after a previous request completed. Completion of an HTTP request
+does not mark that day's source history complete. Coverage distinguishes a current
+day that is updating from past dates still awaiting hours.
 
 A complete hourly block replaces its aggregate without adding both amounts.
 Later cumulative sums are rebuilt. If a daily report is below consumption already

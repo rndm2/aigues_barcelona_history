@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from homeassistant.components.recorder import statistics as ha_statistics
 from homeassistant.helpers.update_coordinator import UpdateFailed
@@ -14,6 +14,7 @@ from test_aigues_barcelona_history import (
     DAILY_ID,
     HOURLY_ID,
     MADRID,
+    NOW,
     FakeStore,
     make_coordinator,
     reading,
@@ -91,6 +92,21 @@ class EnergyRecorderTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.coordinator._import_range(first_day, stop_day, frequencies)
 
+    def set_provider_response(self, daily, hourly):
+        """Match real inclusive DAILY and exclusive HOURLY request dates."""
+
+        def request(start, stop, contract, *, frequency):
+            rows = daily if frequency == "DAILY" else hourly
+            selected = []
+            for row in rows:
+                observed = datetime.fromisoformat(row["datetime"])
+                day = observed.date() if frequency == "DAILY" else observed.astimezone(CET).date()
+                if start <= day and (day <= stop if frequency == "DAILY" else day < stop):
+                    selected.append(row)
+            return selected
+
+        self.coordinator._api.consumptions.side_effect = request
+
     def restart(self, *, daily_fallback=True):
         old = self.coordinator
         self.coordinator = make_coordinator(FakeStore(old._store.saved))
@@ -125,6 +141,106 @@ class EnergyRecorderTests(unittest.IsolatedAsyncioTestCase):
                 "HOURLY": normalize_readings(hourly, Frequency.HOURLY, MADRID),
             },
         )
+        self.assert_native_preserved()
+
+    async def test_today_keeps_real_partial_hours_and_each_normal_refresh_reconciles_them(self):
+        day = NOW.date()
+        daily = [reading(f"{day}T17:02:00+01:00", 100.024, 0.024)]
+        hourly = provider_hours(day, [0, 1, 2])[1:]
+        self.set_provider_response(daily, hourly)
+        first = await self.coordinator._async_update_data()
+        self.assertEqual(first["import_status"]["phase"], "completed")
+        self.assertFalse(self.coordinator._should_import_history)
+        hours = self.recorder_period(day, day + timedelta(days=1), "hour")
+        self.assertEqual([round(row["change"]) for row in hours], [1, 2])
+        self.assertEqual(len(self.fixture.database_rows(ENERGY_ID)), 2)
+        previous_requests = self.coordinator._api.consumptions.call_count
+
+        # The provider corrects a returned hour at an earlier observation minute
+        # and adds another hour after the first run has already completed.
+        updated = [
+            reading(f"{day}T01:01:00+01:00", 100.002, 0.002),
+            reading(f"{day}T02:02:00+01:00", 100.004, 0.002),
+            reading(f"{day}T03:02:00+01:00", 100.008, 0.004),
+        ]
+        self.set_provider_response(daily, updated)
+        second = await self.coordinator._async_update_data()
+        self.assertEqual(second["import_status"]["phase"], "completed")
+        self.assertGreater(self.coordinator._api.consumptions.call_count, previous_requests)
+        requests = self.coordinator._api.consumptions.call_args_list[previous_requests:]
+        self.assertTrue(
+            any(
+                call.kwargs["frequency"] == "HOURLY"
+                and call.args[:2] == (day, day + timedelta(days=1))
+                for call in requests
+            )
+        )
+        self.assertTrue(any(call.args[0] == day - timedelta(days=7) for call in requests))
+        hours = self.recorder_period(day, day + timedelta(days=1), "hour")
+        self.assertEqual([round(row["change"]) for row in hours], [2, 2, 4])
+        self.assertEqual(
+            round(self.recorder_period(day, day + timedelta(days=1), "day")[0]["change"]), 8
+        )
+        self.assertEqual(len(self.fixture.database_rows(ENERGY_ID)), 3)
+        self.assert_native_preserved()
+
+    async def test_next_normal_poll_completes_yesterday_without_creating_today_aggregate(self):
+        day = NOW.date()
+        daily = [reading(f"{day}T17:02:00+01:00", 100.024, 0.024)]
+        self.configure(self.coordinator, daily_fallback=False)
+        self.set_provider_response(daily, provider_hours(day, [1] * 3)[1:])
+        await self.coordinator._async_update_data()
+        previous_requests = self.coordinator._api.consumptions.call_count
+        self.assertEqual(self.coordinator._data["import_status"]["phase"], "completed")
+
+        tomorrow = day + timedelta(days=1)
+        completed = provider_hours(day, [1] * 24)
+        completed.append(reading(f"{tomorrow}T00:02:00+01:00", 100.025, 0.001))
+        daily = [
+            reading(f"{day}T23:02:00+01:00", 100.024, 0.024),
+            reading(f"{tomorrow}T17:02:00+01:00", 100.050, 0.026),
+        ]
+        self.set_provider_response(daily, completed)
+        with patch(
+            "custom_components.aigues_barcelona_history.sensor.dt_util.now",
+            return_value=NOW + timedelta(days=1),
+        ):
+            await self.coordinator._async_update_data()
+        self.assertGreater(self.coordinator._api.consumptions.call_count, previous_requests)
+        requests = self.coordinator._api.consumptions.call_args_list[previous_requests:]
+        self.assertTrue(any(call.args[0] <= day < call.args[1] for call in requests))
+        yesterday = self.recorder_period(day, tomorrow, "hour")
+        self.assertEqual(len(yesterday), 24)
+        self.assertTrue(all(abs(row["change"] - 1) < 1e-6 for row in yesterday))
+        self.assertEqual(round(self.recorder_period(day, tomorrow, "day")[0]["change"]), 24)
+        self.assertEqual(self.recorder_period(tomorrow, tomorrow + timedelta(days=1), "day"), [])
+        self.assertFalse(self.coordinator._should_import_history)
+        self.assertEqual(self.coordinator._data["import_status"]["phase"], "completed")
+        self.assert_native_preserved()
+
+    async def test_recent_day_without_hours_stays_absent_when_partial_hours_are_preferred(self):
+        day = NOW.date()
+        old, detailed, recent = date(2026, 10, 20), date(2026, 10, 25), date(2026, 10, 27)
+        daily = [
+            reading(f"{old}T23:02:00+01:00", 100.1, 0.1),
+            reading(f"{recent}T23:02:00+01:00", 100.148, 0.024),
+            reading(f"{day}T17:02:00+01:00", 100.198, 0.050),
+        ]
+        self.configure(self.coordinator, daily_fallback=False)
+        await self.import_rows(
+            daily,
+            provider_hours(detailed, [1] * 24, counter_before="100.100"),
+            old,
+            day + timedelta(days=1),
+        )
+        self.assertEqual(
+            round(self.recorder_period(old, old + timedelta(days=1), "day")[0]["change"]), 100
+        )
+        self.assertEqual(self.recorder_period(recent, recent + timedelta(days=1), "day"), [])
+        self.assertEqual(self.recorder_period(day, day + timedelta(days=1), "day"), [])
+        self.assertEqual(len(self.fixture.database_rows(ENERGY_ID)), 25)
+        self.assertAlmostEqual(self.fixture.database_rows(ENERGY_ID)[-1][2], 0.124)
+        self.assertEqual(len(self.coordinator._ledger["DAILY"]), 3)
         self.assert_native_preserved()
 
     async def test_complete_hours_replace_one_old_aggregate_without_surplus_or_double_count(self):

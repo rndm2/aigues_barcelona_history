@@ -27,13 +27,14 @@ def hourly_report(day, *, hours=range(24), deltas=None, state=1000):
     return normalize(rows)
 
 
-def project(daily=None, hourly=None, *, since=date(2026, 6, 12), use_daily=True):
+def project(daily=None, hourly=None, *, since=date(2026, 6, 12), use_daily=True, today=None):
     return statistics.build_energy_projection(
         daily or {},
         hourly or {},
         MADRID,
         hourly_since=since,
         use_daily_totals_for_incomplete=use_daily,
+        current_provider_date=today,
     )
 
 
@@ -106,10 +107,95 @@ class EnergyProjectionTests(unittest.TestCase):
         self.assertEqual(actual_coverage["daily_aggregate_dates"], [])
         self.assertEqual(actual_coverage["reported_hours"], 2)
 
-    def test_no_hours_always_allow_coarse_data_even_after_frontier(self):
+    def test_current_or_future_daily_report_cannot_create_a_late_hour_aggregate(self):
+        today = date(2026, 10, 30)
+        daily = daily_report(today, 0.5) | daily_report(today + timedelta(days=1), 0.7)
+        for use_daily in (True, False):
+            with self.subTest(use_daily=use_daily):
+                ledger, coverage = project(daily, today=today, since=None, use_daily=use_daily)
+                self.assertEqual(ledger, {})
+                self.assertEqual(coverage["daily_aggregate_dates"], [])
+                self.assertEqual(coverage["pending_provider_days"], 0)
+                self.assertEqual(coverage["updating_provider_day"], today.isoformat())
+                self.assertEqual(coverage["updating_reported_hours"], 0)
+                self.assertFalse(coverage["updating_provider_day_complete"])
+
+    def test_current_partial_hours_fill_and_correct_without_publishing_daily_amount(self):
+        today = date(2026, 10, 30)
+        daily = daily_report(today, 0.5)
+        first = hourly_report(today, hours=[0])
+        before, progress = project(daily, first, today=today)
+        correction = hourly_report(today, hours=[0, 1], deltas=[0.002, 0.003] + [0] * 22)
+        updated = statistics.merge_ledgers(first, correction)
+        after, current_progress = project(daily, updated, today=today)
+        self.assertEqual(before, first)
+        self.assertEqual(after, updated)
+        self.assertEqual(statistics.build_statistics(before)[-1]["sum"], 0.001)
+        self.assertEqual(statistics.build_statistics(after)[-1]["sum"], 0.005)
+        self.assertEqual(progress["updating_reported_hours"], 1)
+        self.assertEqual(current_progress["updating_reported_hours"], 2)
+        self.assertEqual(current_progress["daily_aggregate_dates"], [])
+        self.assertEqual(current_progress["pending_provider_days"], 0)
+
+    def test_past_partial_day_can_temporarily_use_daily_then_upgrade_to_complete_hours(self):
+        day = date(2026, 10, 30)
+        daily = daily_report(day, 0.024)
+        partial = hourly_report(day, hours=[0, 1])
+        updating, _ = project(daily, partial, today=day)
+        tomorrow = day + timedelta(days=1)
+        coarse, delayed = project(daily, partial, today=tomorrow)
+        complete = hourly_report(day)
+        resolved, progress = project(daily, complete, today=tomorrow)
+        self.assertEqual(len(updating), 2)
+        self.assertEqual(len(coarse), 1)
+        self.assertEqual(statistics.build_statistics(coarse)[-1]["sum"], 0.024)
+        self.assertEqual(delayed["daily_aggregate_dates"], [day.isoformat()])
+        self.assertIsNone(delayed["updating_provider_day"])
+        self.assertEqual(resolved, complete)
+        self.assertLessEqual(coarse.keys(), resolved.keys())
+        self.assertEqual(statistics.build_statistics(resolved)[-1]["sum"], 0.024)
+        self.assertEqual(progress["daily_aggregate_dates"], [])
+        self.assertEqual(progress["pending_provider_days"], 0)
+
+    def test_strict_recent_pending_dates_are_bounded_and_do_not_include_current_day(self):
+        daily = {}
+        for number in range(1, 32):
+            daily |= daily_report(date(2026, 1, number), 0.1)
+        ledger, coverage = project(
+            daily, since=date(2026, 1, 1), today=date(2026, 1, 31), use_daily=False
+        )
+        self.assertEqual(ledger, {})
+        self.assertEqual(coverage["pending_provider_days"], 30)
+        self.assertEqual(len(coverage["pending_provider_dates"]), 14)
+        self.assertEqual(coverage["pending_provider_dates"][-1], "2026-01-30")
+        self.assertEqual(coverage["updating_provider_day"], "2026-01-31")
+
+    def test_current_day_progress_expires_after_complete_hours_arrive_and_day_closes(self):
+        day = date(2026, 10, 30)
+        hours = hourly_report(day)
+        current, updating = project(hourly=hours, today=day)
+        closed, done = project(hourly=hours, today=day + timedelta(days=1))
+        self.assertEqual(current, closed)
+        self.assertEqual(updating["updating_provider_day"], day.isoformat())
+        self.assertTrue(updating["updating_provider_day_complete"])
+        self.assertEqual(updating["updating_reported_hours"], 24)
+        self.assertIsNone(done["updating_provider_day"])
+        self.assertEqual(done["pending_provider_days"], 0)
+
+    def test_strict_recent_zero_hour_day_stays_pending_while_old_prefix_uses_daily(self):
         ledger, coverage = project(daily_report(date(2026, 10, 27), 0.739), use_daily=False)
-        self.assertEqual(len(ledger), 1)
-        self.assertEqual(coverage["daily_aggregate_dates"], ["2026-10-27"])
+        self.assertEqual(ledger, {})
+        self.assertEqual(coverage["daily_aggregate_dates"], [])
+        self.assertEqual(coverage["pending_provider_days"], 1)
+        self.assertEqual(coverage["pending_provider_dates"], ["2026-10-27"])
+        old, metadata = project(daily_report(date(2026, 6, 11), 0.559), use_daily=False)
+        self.assertEqual(len(old), 1)
+        self.assertEqual(metadata["daily_aggregate_dates"], ["2026-06-11"])
+        self.assertEqual(metadata["pending_provider_days"], 0)
+        no_frontier, _ = project(
+            daily_report(date(2026, 10, 27), 0.739), use_daily=False, since=None
+        )
+        self.assertEqual(len(no_frontier), 1)
 
     def test_missing_daily_keeps_actual_partial_hours_without_counter_interpolation(self):
         hours = hourly_report(date(2026, 1, 10), hours=[0, 23])
@@ -164,7 +250,7 @@ class EnergyProjectionTests(unittest.TestCase):
             daily |= daily_report(date(2026, 6, number), 0.024)
         partial = hourly_report(date(2026, 6, 11), hours=range(7, 24))
         full = hourly_report(date(2026, 6, 12))
-        ledger, coverage = project(daily, partial | full, use_daily=False)
+        ledger, coverage = project(daily, partial | full)
         self.assertEqual(local_totals(ledger, "month"), {"2026-06": Decimal("0.720")})
         self.assertEqual(coverage["daily_aggregate_days"], 29)
         self.assertEqual(coverage["complete_hourly_blocks"], 1)
@@ -266,6 +352,9 @@ class EnergyProjectionTests(unittest.TestCase):
         for since, policy in ((datetime(2026, 1, 1), True), ("2026-01-01", True), (None, 1)):
             with self.subTest(since=since, policy=policy), self.assertRaises(ValueError):
                 project(since=since, use_daily=policy)
+        for today in ("2026-01-01", datetime(2026, 1, 1), True):
+            with self.subTest(today=today), self.assertRaises(ValueError):
+                project(today=today)
         invalid = hourly_report(date(2026, 1, 10), hours=[0])
         next(iter(invalid.values()))["delta"] = -1
         with self.assertRaises(ValueError):
