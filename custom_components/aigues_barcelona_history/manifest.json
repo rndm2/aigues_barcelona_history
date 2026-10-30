@@ -19,5 +19,5 @@
   "requirements": [
     "2captcha-python==2.1.2"
   ],
-  "version": "0.4.3"
+  "version": "0.4.4"
 }

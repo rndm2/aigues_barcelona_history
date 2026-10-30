@@ -151,7 +151,9 @@ class HourlyRecoveryTests(OfflineTests):
             for call in self.coordinator._api.consumptions.call_args_list
             if call.kwargs["frequency"] == "HOURLY"
         ]
-        self.assertEqual(len(hourly_calls), 3, "Each padded window is fetched once")
+        self.assertEqual(
+            len(hourly_calls), 2, "Historical and current provider dates are fetched once"
+        )
         self.assertEqual(self.coordinator._data["imported_intervals"], {"daily": 1, "hourly": 1})
 
         recovered = reading("2026-10-28T16:01:26+01:00", 102.0, 0.3)

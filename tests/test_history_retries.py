@@ -193,7 +193,9 @@ class ConsumptionRetryTests(OfflineTests):
         self.coordinator._store.async_save.assert_not_awaited()
         self.queue.async_import_statistics.assert_not_called()
         self.assertEqual(self.coordinator._store.saved, before)
-        self.assertEqual(self.coordinator._ledger, before)
+        self.assertEqual(
+            self.coordinator._ledger, {key: before[key] for key in ("DAILY", "HOURLY")}
+        )
         self.assertEqual(self.coordinator._api.consumptions.call_count, 6)
 
     async def test_empty_hourly_keeps_previous_hours_and_updates_daily_totals(self):
@@ -218,7 +220,7 @@ class ConsumptionRetryTests(OfflineTests):
             for c in self.coordinator._api.consumptions.call_args_list
             if c.kwargs["frequency"] == "HOURLY"
         ]
-        self.assertEqual(len(hourly_calls), 1)
+        self.assertEqual(len(hourly_calls), 2, "Winter bounds include the next date's end reading")
         self.assertEqual(next(iter(old_hourly.values()))["delta"], 0.062)
 
 

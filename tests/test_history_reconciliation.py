@@ -46,15 +46,15 @@ class HourlyReconciliationTests(unittest.TestCase):
         original = normalize(
             [
                 reading("2026-10-22T22:01:00+01:00", 100, 0.2),
-                reading("2026-10-22T23:01:00+01:00", 101, 0.3),
-                reading("2026-10-23T23:01:00+01:00", 102, 0.4),
+                reading("2026-10-23T00:01:00+01:00", 101, 0.3),
+                reading("2026-10-24T00:01:00+01:00", 102, 0.4),
             ]
         )
         update = normalize(
             [
                 reading("2026-10-22T22:01:00+01:00", 200, 9),
-                reading("2026-10-22T23:01:00+01:00", 201, 0.5),
-                reading("2026-10-23T23:01:00+01:00", 202, 9),
+                reading("2026-10-23T00:01:00+01:00", 201, 0.5),
+                reading("2026-10-24T00:01:00+01:00", 202, 9),
             ]
         )
         result = self.reconcile(original, update)
@@ -69,8 +69,8 @@ class HourlyReconciliationTests(unittest.TestCase):
     def test_normalization_filters_by_ha_day_before_resolving_duplicates(self):
         result = statistics.normalize_readings(
             [
-                reading("2026-10-22T23:01:00+01:00", 100, 0.015),
-                reading("2026-10-23T23:01:00+01:00", 101, 0.5),
+                reading("2026-10-23T00:01:00+01:00", 100, 0.015),
+                reading("2026-10-24T00:01:00+01:00", 101, 0.5),
             ],
             "HOURLY",
             MADRID,

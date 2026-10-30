@@ -157,11 +157,31 @@ invented monthly or hourly readings.
 
 ## Time, corrections and persistence
 
-Hourly timestamps retain their supplied offset and map to UTC buckets. HA groups
-them using its local calendar. Europe/Madrid summer/winter boundaries and
-23/25-hour days are tested. Requests follow the observed fixed-CET provider-date
-convention, include the preceding boundary date, and keep the current provider
-day separate from historical queries.
+Hourly timestamps retain their supplied offset. The provider frontend converts
+these readings to Europe/Madrid and labels each point with the meter's reading
+time. Its `deltaConsumption` describes consumption since the preceding reading.
+HA statistics instead identify the **start** of the consumption period, with the
+meter state at its end. History therefore assigns a reading to the preceding
+UTC hour, then lets HA group those intervals by its local calendar. This is an
+interval-end conversion, not a daylight-saving offset correction.
+
+Europe/Madrid summer/winter boundaries and 23/25-hour days are tested. Requests
+include the boundary readings needed to finish the requested HA days, including
+the following provider date in winter. The current provider day remains separate
+from historical queries. Missing hours are never filled from meter differences.
+
+The provider's selected query date is not always an HA calendar day. Its observed
+fixed-CET date convention can end a winter daily report around 23:00 Madrid. Thus
+the separate **Provider daily totals (reference)** can differ from a civil HA day
+even with complete hours. The canonical hourly series supplies both HA's daily
+and hourly consumption views. These use the same actual intervals.
+An Aigües point labeled 01:02 is a closing meter reading. Its consumption appears
+in HA's preceding 00:00 interval, so the printed hour labels differ by design.
+
+Version 0.4.4 repairs previously saved reading-time buckets once. It retains all
+original readings and amounts, saves a replay marker, replaces only History's
+hourly statistic through recorder, and verifies the replacement before marking
+the repair complete. An interrupted replay is retried from the durable source.
 
 New hours are inserted and returned hourly corrections replace saved values,
 even if their observation minute moved backwards. Only returned source intervals

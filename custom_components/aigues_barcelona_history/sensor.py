@@ -6,6 +6,8 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from functools import partial
+import hashlib
+import json
 import logging
 import math
 import time
@@ -73,10 +75,12 @@ from .identity import (
 )
 from .settings import effective_settings, validate_history_days
 from .statistics import (
+    HOURLY_INTERVAL,
     Frequency,
     build_statistics,
     describe_hourly_coverage,
     describe_interval_coverage,
+    migrate_legacy_hourly_ledger,
     normalize_readings,
     plan_windows,
     reconcile_intervals,
@@ -89,6 +93,7 @@ MAX_INLINE_RETRY_SECONDS = 60
 MIN_REQUEST_INTERVAL_SECONDS = 1
 # The API's query-date labels and supplied timestamps use fixed CET year round.
 PROVIDER_TIME_ZONE = timezone(timedelta(hours=1))
+HOURLY_INTERVAL_VERSION = 2
 
 
 def _empty_import_status():
@@ -148,6 +153,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         )
         self._store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.{self.id}")
         self._ledger = None
+        self._hourly_replay_pending = False
         self._stopping = False
         self._manual_import_reserved = False
         self._data = domain_data.setdefault(self.contract, {})
@@ -388,7 +394,78 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             saved = await self._store.async_load()
             if saved is None:
                 saved = {frequency.value: {} for frequency in Frequency}
-            self._ledger, _ = self._prepare_statistics(saved)
+            if not isinstance(saved, dict):
+                raise ValueError("Saved History intervals must be a mapping")
+            version = saved.get("hourly_interval_version", 1)
+            pending = saved.get("hourly_replay_pending", False)
+            if (
+                not isinstance(version, int)
+                or isinstance(version, bool)
+                or version not in (1, HOURLY_INTERVAL_VERSION)
+                or not isinstance(pending, bool)
+                or (version == 1 and pending)
+            ):
+                raise ValueError("Unsupported saved hourly interval format")
+            if pending and saved.get("hourly_replay_source_sha256") != self._hourly_source_sha256(
+                saved[Frequency.HOURLY.value]
+            ):
+                raise ValueError(
+                    "Pending hourly replay source checksum does not match saved intervals"
+                )
+            candidate = dict(saved)
+            if version == 1 and saved[Frequency.HOURLY.value]:
+                candidate[Frequency.HOURLY.value] = migrate_legacy_hourly_ledger(
+                    saved[Frequency.HOURLY.value], dt_util.DEFAULT_TIME_ZONE
+                )
+                candidate, _ = self._prepare_statistics(candidate)
+                await self._check_replay_coverage(saved)
+                await self._save_ledger(candidate, replay_pending=True)
+            else:
+                candidate, _ = self._prepare_statistics(candidate)
+                self._hourly_replay_pending = pending
+            self._ledger = candidate
+
+    async def _save_ledger(self, ledger, *, replay_pending=None) -> None:
+        """Persist source intervals and replay state together before recorder writes."""
+        if replay_pending is None:
+            replay_pending = getattr(self, "_hourly_replay_pending", False)
+        saved = {
+            **ledger,
+            "hourly_interval_version": HOURLY_INTERVAL_VERSION,
+            "hourly_replay_pending": replay_pending,
+        }
+        if replay_pending:
+            saved["hourly_replay_source_sha256"] = self._hourly_source_sha256(
+                ledger[Frequency.HOURLY.value]
+            )
+        await self._store.async_save(saved)
+        self._hourly_replay_pending = replay_pending
+
+    @staticmethod
+    def _hourly_source_sha256(hourly_ledger) -> str:
+        """Bind a destructive replay to the exact durable source approved for it."""
+        serialized = json.dumps(
+            hourly_ledger, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        return hashlib.sha256(serialized.encode()).hexdigest()
+
+    @staticmethod
+    def _assert_recorded_coverage(actual, expected_starts) -> None:
+        if not actual.keys() <= expected_starts:
+            raise ValueError(
+                "History interval ledger is missing recorded intervals; "
+                "restore its backup before importing"
+            )
+
+    async def _check_replay_coverage(self, ledger, *, allow_legacy_hours=False) -> None:
+        """Protect both source histories before replacing the owned hourly series."""
+        for frequency in Frequency:
+            points = build_statistics(ledger[frequency.value])
+            actual = await self._statistics_snapshot(frequency, points)
+            expected = {point["start"].timestamp() for point in points}
+            if allow_legacy_hours and frequency is Frequency.HOURLY:
+                expected |= {timestamp + HOURLY_INTERVAL.total_seconds() for timestamp in expected}
+            self._assert_recorded_coverage(actual, expected)
 
     async def _wait_for_request(self, backoff: float, *, minimum_delay: float = 0) -> None:
         while True:
@@ -500,12 +577,16 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         if start >= end:
             plan_windows(start, end, frequency)  # Validate reversed or invalid bounds.
             return []
-        # The provider labels hours in fixed CET. Madrid's summer midnight is
-        # in the preceding provider date. Fetch that boundary, then filter by
-        # the requested HA dates. Keep today's unreliable API response separate.
-        query_begin = start - timedelta(days=1) if frequency is Frequency.HOURLY else start
+        query_begin, query_stop = start, end
+        if frequency is Frequency.HOURLY:
+            # Each reading closes the preceding UTC hour. Include the closing
+            # reading at the requested end boundary, also across DST changes.
+            first_end = dt_util.as_utc(dt_util.start_of_local_day(start)) + HOURLY_INTERVAL
+            last_end = dt_util.as_utc(dt_util.start_of_local_day(end))
+            query_begin = first_end.astimezone(PROVIDER_TIME_ZONE).date()
+            query_stop = last_end.astimezone(PROVIDER_TIME_ZONE).date() + timedelta(days=1)
         provider_today = dt_util.now().astimezone(PROVIDER_TIME_ZONE).date()
-        query_stop = min(end, provider_today + timedelta(days=1))
+        query_stop = min(query_stop, provider_today + timedelta(days=1))
         if query_begin >= query_stop:
             return []
         return plan_windows(
@@ -587,7 +668,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                     )
                 candidate, _ = self._prepare_statistics(candidate)
                 self._assert_active()
-                await self._store.async_save(candidate)
+                await self._save_ledger(candidate)
                 self._ledger = candidate
                 await self._publish()
                 self._update_display()
@@ -645,6 +726,16 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         """Trust recorder readback, not successful queueing or an in-memory cache."""
         self._assert_active()
         _, statistics = self._prepare_statistics(self._ledger)
+        replay_pending = getattr(self, "_hourly_replay_pending", False)
+        if replay_pending:
+            if not self._ledger[Frequency.HOURLY.value]:
+                raise ValueError("Cannot replay an empty saved hourly history")
+            await self._check_replay_coverage(self._ledger, allow_legacy_hours=True)
+            self._assert_active()
+            recorder = get_instance(self.hass)
+            recorder.async_clear_statistics([self.statistic_ids[Frequency.HOURLY]])
+            await recorder.async_block_till_done()
+            self._assert_active()
         stored_metadata = await self._stored_metadata()
         metadata = {frequency: self._statistic_metadata(frequency) for frequency in Frequency}
         expected = {
@@ -657,11 +748,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         # Check coverage for both series before enqueueing either one.
         for frequency, points in statistics.items():
             actual = await self._statistics_snapshot(frequency, points)
-            if not actual.keys() <= expected[frequency].keys():
-                raise ValueError(
-                    "History interval ledger is missing recorded intervals; "
-                    "restore its backup before importing"
-                )
+            self._assert_recorded_coverage(actual, expected[frequency].keys())
             stored = stored_metadata.get(self.statistic_ids[frequency])
             name_changed = stored is None or stored[1]["name"] != metadata[frequency]["name"]
             if not self._snapshot_matches(actual, expected[frequency]) or (points and name_changed):
@@ -679,6 +766,8 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 stored = stored_metadata.get(self.statistic_ids[frequency])
                 if stored is None or stored[1]["name"] != metadata[frequency]["name"]:
                     raise UpdateFailed("Recorder did not persist the History series name")
+        if replay_pending:
+            await self._save_ledger(self._ledger, replay_pending=False)
 
     def _update_display(self) -> None:
         readings = [row for ledger in self._ledger.values() for row in ledger.values()]
