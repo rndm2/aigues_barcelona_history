@@ -164,6 +164,16 @@ For example contract `EXAMPLE123`:
 | Canonical consumption | `aigues_barcelona_history:example123_hourly_consumption` |
 | Provider daily reference | `aigues_barcelona_history:example123_consumption` |
 
+All three published statistics use **litres (L)**. Provider responses and the
+durable source ledger retain their original cubic metres. History converts at
+the publication boundary using HA's volume converter. On upgrade from an older
+release, it republishes the complete validated history with matching values and
+unit metadata, retaining the same statistic IDs and timestamps. Repeated
+refreshes do not multiply the saved readings again.
+
+The meter display also suggests litres with no decimal places. An existing HA
+unit preference takes precedence and can be changed in the entity settings.
+
 Select **Water consumption** as the single Energy water source for
 the meter. It retains older daily history and uses actual hours for complete
 provider reporting blocks. Do not also select the source-only statistics or

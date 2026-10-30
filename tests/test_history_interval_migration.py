@@ -19,9 +19,9 @@ from test_aigues_barcelona_history import (
 )
 import test_history_integrity as recorder_fixture
 
+from custom_components.aigues_barcelona_history.sensor import _published_statistics
 from custom_components.aigues_barcelona_history.statistics import (
     Frequency,
-    build_statistics,
     normalize_readings,
 )
 
@@ -70,7 +70,7 @@ class IntervalMigrationTests(OfflineTests):
         for frequency in Frequency:
             self.record_points(
                 self.coordinator._statistic_metadata(frequency),
-                build_statistics(saved[frequency.value]),
+                _published_statistics(saved[frequency.value]),
                 Statistics,
             )
         self.recorded["sensor.contador_test123"] = {0: {"state": 100, "sum": 100}}
@@ -332,7 +332,7 @@ class SQLiteIntervalMigrationTests(unittest.IsolatedAsyncioTestCase):
             ha_statistics.import_statistics(
                 fixture.queue,
                 fixture.coordinator._statistic_metadata(frequency),
-                build_statistics(saved[frequency.value]),
+                _published_statistics(saved[frequency.value]),
                 Statistics,
             )
         daily_before = fixture.database_rows(DAILY_ID)

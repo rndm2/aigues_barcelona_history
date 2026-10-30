@@ -109,6 +109,21 @@ MIN_REQUEST_INTERVAL_SECONDS = 1
 HOURLY_INTERVAL_VERSION = 2
 ENERGY_SERIES = "ENERGY"
 ENERGY_PROJECTION_VERSION = 1
+SOURCE_VOLUME_UNIT = UnitOfVolume.CUBIC_METERS
+PUBLISHED_VOLUME_UNIT = UnitOfVolume.LITERS
+
+
+def _published_statistics(ledger):
+    """Convert validated source points to litres only at the recorder boundary."""
+    convert = VolumeConverter.converter_factory(SOURCE_VOLUME_UNIT, PUBLISHED_VOLUME_UNIT)
+    points = build_statistics(ledger)
+    for point in points:
+        for field in ("state", "sum"):
+            converted = convert(point[field])
+            if not math.isfinite(converted):
+                raise ValueError("Published litre statistics must remain finite")
+            point[field] = converted
+    return points
 
 
 def _empty_import_status():
@@ -421,7 +436,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             canonical[frequency.value] = validate_saved_ledger(
                 ledger[frequency.value], frequency, dt_util.DEFAULT_TIME_ZONE
             )
-            statistics[frequency] = build_statistics(canonical[frequency.value])
+            statistics[frequency] = _published_statistics(canonical[frequency.value])
         return canonical, statistics
 
     async def _load_ledger(self) -> None:
@@ -959,8 +974,27 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             "name": f"{NAME} {self.id}: {roles[frequency]}",
             "source": DOMAIN,
             "statistic_id": self._statistic_id(frequency),
-            "unit_of_measurement": UnitOfVolume.CUBIC_METERS,
+            "unit_of_measurement": PUBLISHED_VOLUME_UNIT,
         }
+
+    @staticmethod
+    def _assert_owned_metadata(stored_metadata):
+        """Rebuild only this integration's statistics in known volume units."""
+        for _, metadata in stored_metadata.values():
+            if (
+                metadata.get("source") != DOMAIN
+                or metadata.get("unit_class") != VolumeConverter.UNIT_CLASS
+                or metadata.get("unit_of_measurement")
+                not in (SOURCE_VOLUME_UNIT, PUBLISHED_VOLUME_UNIT)
+            ):
+                raise ValueError("History statistics have unsupported ownership or volume units")
+
+    @staticmethod
+    def _metadata_matches(stored, expected):
+        """Check all published metadata, including units when every value is zero."""
+        return stored is not None and all(
+            stored[1].get(field) == value for field, value in expected.items()
+        )
 
     async def _stored_metadata(self):
         return await get_instance(self.hass).async_add_executor_job(
@@ -989,9 +1023,11 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
     async def _publish(self) -> None:
         """Trust recorder readback, not successful queueing or an in-memory cache."""
         self._assert_active()
+        stored_metadata = await self._stored_metadata()
+        self._assert_owned_metadata(stored_metadata)
         _, statistics = self._prepare_statistics(self._ledger)
         energy, coverage = self._energy_projection()
-        statistics[ENERGY_SERIES] = build_statistics(energy)
+        statistics[ENERGY_SERIES] = _published_statistics(energy)
         replay_pending = getattr(self, "_hourly_replay_pending", False)
         if replay_pending:
             if not self._ledger[Frequency.HOURLY.value]:
@@ -1002,7 +1038,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             recorder.async_clear_statistics([self.statistic_ids[Frequency.HOURLY]])
             await recorder.async_block_till_done()
             self._assert_active()
-        stored_metadata = await self._stored_metadata()
+            stored_metadata = await self._stored_metadata()
         metadata = {series: self._statistic_metadata(series) for series in statistics}
         expected = {
             frequency: {
@@ -1038,8 +1074,10 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         for frequency, points in statistics.items():
             actual = snapshots[frequency]
             stored = stored_metadata.get(self._statistic_id(frequency))
-            name_changed = stored is None or stored[1]["name"] != metadata[frequency]["name"]
-            if not self._snapshot_matches(actual, expected[frequency]) or (points and name_changed):
+            metadata_changed = not self._metadata_matches(stored, metadata[frequency])
+            if not self._snapshot_matches(actual, expected[frequency]) or (
+                (points or stored is not None) and metadata_changed
+            ):
                 changed.append(frequency)
         for frequency in changed:
             self._assert_active()
@@ -1052,8 +1090,8 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 if not self._snapshot_matches(actual, expected[frequency]):
                     raise UpdateFailed("Recorder did not persist the complete History batch")
                 stored = stored_metadata.get(self._statistic_id(frequency))
-                if stored is None or stored[1]["name"] != metadata[frequency]["name"]:
-                    raise UpdateFailed("Recorder did not persist the History series name")
+                if not self._metadata_matches(stored, metadata[frequency]):
+                    raise UpdateFailed("Recorder did not persist the History series metadata")
         if replay_pending:
             await self._save_ledger(self._ledger, replay_pending=False)
         self._data["energy_coverage"] = coverage
@@ -1178,7 +1216,9 @@ class AiguesHistoryMeter(CoordinatorEntity, SensorEntity):
     _attr_should_poll = False
     _attr_device_class = SensorDeviceClass.WATER
     _attr_state_class = None
-    _attr_native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
+    _attr_native_unit_of_measurement = SOURCE_VOLUME_UNIT
+    _attr_suggested_unit_of_measurement = PUBLISHED_VOLUME_UNIT
+    _attr_suggested_display_precision = 0
 
     def __init__(self, coordinator):
         super().__init__(coordinator)

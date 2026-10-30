@@ -146,7 +146,7 @@ class HourlyRecoveryTests(OfflineTests):
 
         self.assertEqual(self.coordinator._store.saved["HOURLY"], previous_hourly)
         self.assertEqual(set(self.publications()), {DAILY_ID, ENERGY_ID})
-        self.assertEqual(self.publications()[DAILY_ID][1][0]["sum"], 1.7)
+        self.assertEqual(self.publications()[DAILY_ID][1][0]["sum"], 1700)
         hourly_calls = [
             call
             for call in self.coordinator._api.consumptions.call_args_list
@@ -167,7 +167,7 @@ class HourlyRecoveryTests(OfflineTests):
         self.assertEqual(set(self.publications()), {HOURLY_ID})
         points = self.publications()[HOURLY_ID][1]
         self.assertEqual(len(points), 2, "No hourly records may be synthesized")
-        self.assertEqual([point["state"] for point in points], [100.0, 102.0])
-        self.assertEqual([point["sum"] for point in points], [0.2, 0.5])
+        self.assertEqual([point["state"] for point in points], [100000, 102000])
+        self.assertEqual([point["sum"] for point in points], [200, 500])
         self.assertEqual((points[1]["start"] - points[0]["start"]).total_seconds(), 30 * 3600)
         self.assertEqual(self.coordinator._data["imported_intervals"], {"daily": 1, "hourly": 2})

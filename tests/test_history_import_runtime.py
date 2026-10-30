@@ -262,14 +262,16 @@ class ImportRuntimeStatusTests(OfflineTests):
         await entered.wait()
         state = hass.states.get(meter.entity_id)
         self.assertTrue(meter.available)
-        self.assertEqual(float(state.state), 12)
+        self.assertEqual(float(state.state), 12000)
+        self.assertEqual(state.attributes["unit_of_measurement"], "L")
         self.assertEqual(state.attributes["import_status"]["phase"], "running")
         self.assertEqual(state.attributes["provider_daily_coverage"]["known_intervals"], 1)
         release.set()
         with self.assertRaises(AiguesApiError):
             await task
         state = hass.states.get(meter.entity_id)
-        self.assertEqual(float(state.state), 12)
+        self.assertEqual(float(state.state), 12000)
+        self.assertEqual(state.attributes["unit_of_measurement"], "L")
         self.assertEqual(state.attributes["import_status"]["phase"], "failed")
         self.assertTrue(meter.available)
 
