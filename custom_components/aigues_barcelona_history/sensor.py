@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from functools import partial
 import logging
@@ -36,12 +37,13 @@ from homeassistant.helpers.update_coordinator import (
 )
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import VolumeConverter
-from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
+from requests.exceptions import ChunkedEncodingError, ConnectionError, RequestException, Timeout
 from voluptuous import Invalid
 
 from . import canonical_contracts
 from .api import (
     AiguesApiAuthError,
+    AiguesApiError,
     AiguesApiRateLimitError,
     AiguesApiServerError,
     AiguesApiSessionLimitError,
@@ -51,6 +53,7 @@ from .const import (
     ATTR_LAST_MEASURE,
     CONF_2CAPTCHA_APIKEY,
     CONF_AUTH_SESSION_LIMIT,
+    CONF_CONTRACT,
     CONF_HISTORY_DAYS,
     CONF_HOURLY_HISTORY_DAYS,
     CONF_RETRY_NOT_BEFORE,
@@ -61,6 +64,12 @@ from .const import (
     DOMAIN,
     IMPORT_PHASES,
     NAME,
+)
+from .identity import (
+    canonical_account,
+    contracts_from_response,
+    contracts_include,
+    token_matches_account,
 )
 from .settings import effective_settings, validate_history_days
 from .statistics import (
@@ -227,29 +236,119 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             "Aigües session limit requires explicit authentication recovery"
         )
 
+    def _existing_session_tokens(self, account: str):
+        """Read only configured account/token fields, never another integration's runtime."""
+        tokens = []
+        for domain in ("aigues_barcelona", DOMAIN):
+            for source in self.hass.config_entries.async_entries(domain):
+                if source.entry_id == self.entry_id:
+                    continue
+                try:
+                    matches = canonical_account(source.data.get(CONF_USERNAME, "")) == account
+                except ValueError:
+                    matches = False
+                if matches:
+                    tokens.append(source.data.get(CONF_TOKEN))
+        tokens.extend((self._entry().data.get(CONF_TOKEN), self._api.get_token()))
+        return list(
+            dict.fromkeys(
+                token.strip() for token in tokens if isinstance(token, str) and token.strip()
+            )
+        )
+
+    async def _reuse_existing_session(self) -> bool:
+        """Adopt only a fresh same-account session validated by the provider."""
+        entry = self._entry()
+        try:
+            account = canonical_account(entry.data.get(CONF_USERNAME, ""))
+        except ValueError:
+            return False
+        if not account:
+            return False
+        for token in self._existing_session_tokens(account):
+            self._assert_active()
+            # Validation never receives another entry's password or CAPTCHA key.
+            candidate = AiguesBarcelonaHistoryApiClient(account, "", "", self.contract)
+            try:
+                candidate.set_token(token)
+                if not token_matches_account(candidate, account) or candidate.is_token_expired():
+                    continue
+                try:
+                    async with self._provider_request_slot():
+                        if candidate.is_token_expired():
+                            continue
+                        rows = await self.hass.async_add_executor_job(candidate.contracts, account)
+                    self._assert_active()
+                except AiguesApiSessionLimitError:
+                    self._update_entry_data(**{CONF_AUTH_SESSION_LIMIT: True})
+                    continue
+                except AiguesApiAuthError:
+                    self._assert_active()
+                    continue
+                except (AiguesApiError, RequestException) as err:
+                    self._assert_active()
+                    self._persist_retry_pause(err)
+                    raise
+                try:
+                    available = contracts_from_response(rows)
+                    required = canonical_contracts(entry.data[CONF_CONTRACT])
+                except KeyError, TypeError, ValueError:
+                    raise AiguesApiError("Provider session contract validation failed") from None
+                if not required or not contracts_include(available, required):
+                    continue
+                # A near-expiry session must still be usable after the GET returns.
+                if not token_matches_account(candidate, account) or candidate.is_token_expired():
+                    continue
+                validated_token = candidate.get_token()
+                if not isinstance(validated_token, str) or not validated_token:
+                    continue
+                self._assert_active()
+                self._api.set_token(validated_token)
+                self._update_entry_data(
+                    **{
+                        CONF_TOKEN: validated_token,
+                        CONF_AUTH_SESSION_LIMIT: False,
+                    }
+                )
+                _LOGGER.info("Reused a provider-validated configured Aigües session")
+                return True
+            finally:
+                candidate.cli.close()
+        return False
+
     async def _ensure_token(self) -> None:
-        """Persist known session limits so automatic runs cannot buy more logins."""
+        """Prefer existing sessions and never retry a known blocked paid login."""
         async with self._token_lock:
             self._assert_active()
             entry = self._entry()
-            if entry.data.get(CONF_AUTH_SESSION_LIMIT, False):
-                raise self._session_limit_failure()
-            if not self._api.is_token_expired():
-                return
-            if stored := entry.data.get(CONF_TOKEN):
-                self._api.set_token(stored)
+            if not entry.data.get(CONF_AUTH_SESSION_LIMIT, False):
                 if not self._api.is_token_expired():
                     return
+                if stored := entry.data.get(CONF_TOKEN):
+                    self._api.set_token(stored)
+                    if not self._api.is_token_expired():
+                        return
+            if await self._reuse_existing_session():
+                return
+            if entry.data.get(CONF_AUTH_SESSION_LIMIT, False):
+                raise self._session_limit_failure()
             if not entry.data.get(CONF_PASSWORD) or not entry.data.get(CONF_2CAPTCHA_APIKEY):
                 raise ConfigEntryAuthFailed("Provide a current token or sign-in credentials")
             try:
                 login_ok = await self.hass.async_add_executor_job(self._api.login)
             except AiguesApiSessionLimitError as err:
+                self._update_entry_data(**{CONF_AUTH_SESSION_LIMIT: True})
+                # Another configured entry may have renewed its session while our
+                # one paid attempt was in flight. Recheck once, never buy a retry.
+                if await self._reuse_existing_session():
+                    return
                 raise self._session_limit_failure() from err
             self._assert_active()
             token = self._api.get_token()
             if not login_ok or not token:
                 raise RuntimeError("Aigües login did not return a token")
+            if self._api.is_token_expired():
+                raise RuntimeError("Aigües login returned an expired or invalid token")
             self._update_entry_data(**{CONF_TOKEN: token})
 
     async def _async_update_data(self):
@@ -312,6 +411,44 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             backoff = 0
             minimum_delay = 0
 
+    @asynccontextmanager
+    async def _provider_request_slot(self):
+        """Share one paced GET slot; callers must authenticate before acquiring it."""
+        async with self._request_gate["lock"]:
+            await self._wait_for_request(
+                0, minimum_delay=self._request_gate["next_request_at"] - monotonic()
+            )
+            try:
+                yield
+            finally:
+                self._request_gate["next_request_at"] = monotonic() + MIN_REQUEST_INTERVAL_SECONDS
+
+    @asynccontextmanager
+    async def _authenticated_request_slot(self):
+        """Recheck expiry after waiting, renewing only outside the GET gate."""
+        while True:
+            needed_recovery = self._api.is_token_expired()
+            await self._ensure_token()
+            if self._api.is_token_expired():
+                raise RuntimeError("Aigües authentication did not return a current token")
+            async with self._provider_request_slot():
+                if self._api.is_token_expired():
+                    if needed_recovery:
+                        raise RuntimeError(
+                            "Aigües token expired while waiting for a provider request"
+                        )
+                    continue
+                yield
+                return
+
+    def _persist_retry_pause(self, error) -> None:
+        """Keep consumption and session validation pauses under one provider policy."""
+        if (retry_after := getattr(error, "retry_after", None)) is not None:
+            deadline = max(
+                self._entry().data.get(CONF_RETRY_NOT_BEFORE, 0), time.time() + retry_after
+            )
+            self._update_entry_data(**{CONF_RETRY_NOT_BEFORE: deadline})
+
     async def _request_consumptions(self, start: date, end: date, frequency: Frequency) -> list:
         """Pace History GETs and retry transient failures without shortening pauses."""
         request = partial(
@@ -322,12 +459,8 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             frequency=frequency.value,
         )
         for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
-            async with self._request_gate["lock"]:
-                await self._wait_for_request(
-                    0 if attempt == 1 else 2 ** (attempt - 2),
-                    minimum_delay=self._request_gate["next_request_at"] - monotonic(),
-                )
-                await self._ensure_token()
+            await self._wait_for_request(0 if attempt == 1 else 2 ** (attempt - 2))
+            async with self._authenticated_request_slot():
                 self._assert_active()
                 try:
                     rows = await self.hass.async_add_executor_job(request)
@@ -348,13 +481,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 ) as err:
                     self._assert_active()
                     self._set_import_status(phase="retrying", last_error=type(err).__name__)
-                    retry_after = getattr(err, "retry_after", None)
-                    if retry_after is not None:
-                        deadline = max(
-                            self._entry().data.get(CONF_RETRY_NOT_BEFORE, 0),
-                            time.time() + retry_after,
-                        )
-                        self._update_entry_data(**{CONF_RETRY_NOT_BEFORE: deadline})
+                    self._persist_retry_pause(err)
                     if attempt == MAX_FETCH_ATTEMPTS:
                         raise
                     _LOGGER.warning(
@@ -366,10 +493,6 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                         type(err).__name__,
                         attempt,
                         MAX_FETCH_ATTEMPTS,
-                    )
-                finally:
-                    self._request_gate["next_request_at"] = (
-                        monotonic() + MIN_REQUEST_INTERVAL_SECONDS
                     )
 
     def _fetch_windows(self, start: date, end: date, frequency: Frequency):

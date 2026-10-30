@@ -6,7 +6,7 @@ import asyncio
 from copy import deepcopy
 from datetime import date
 from types import MethodType
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import UpdateFailed
@@ -228,6 +228,7 @@ class CoordinatorSafetyTests(OfflineTests):
         for status in (501, 505):
             with self.subTest(status=status):
                 client, transport = client_for(status)
+                client.is_token_expired = Mock(return_value=False)
                 self.coordinator._api = client
                 with patch.object(sensor.asyncio, "sleep", new_callable=AsyncMock) as sleep:
                     with self.assertRaises(AiguesApiError) as caught:

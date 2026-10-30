@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.3 — 2026-10-30
+
+- Reuse a server-validated, unexpired session for the same account before a background update buys another login.
+- Verify all configured contracts and update only History's own authentication data.
+- Recover a session-limit race when another integration has just renewed a usable session.
+- Keep the paid-login block durable during cancellation and preserve request pacing and token-expiry checks.
+
 ## 0.4.2 — 2026-10-30
 
 - Fix startup-listener cleanup during reload and unloading.

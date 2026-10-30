@@ -102,13 +102,20 @@ class SharedRequestPacingTests(OfflineTests):
         self.coordinator._ensure_token = MethodType(
             sensor.AiguesHistoryCoordinator._ensure_token, self.coordinator
         )
-        self.coordinator._api.is_token_expired.side_effect = [False, True, True]
-        self.coordinator._api.login.return_value = True
+        expired = [False]
+        self.coordinator._api.is_token_expired.side_effect = lambda: expired[0]
+
+        def login():
+            expired[0] = False
+            return True
+
+        self.coordinator._api.login.side_effect = login
         self.coordinator._api.get_token.return_value = "renewed-token"
         seen = []
 
         def response(*args, **kwargs):
             seen.append(entry.data[CONF_TOKEN])
+            expired[0] = True
             return []
 
         self.coordinator._api.consumptions.side_effect = response
@@ -117,7 +124,7 @@ class SharedRequestPacingTests(OfflineTests):
         self.assertEqual(seen, ["old-token", "renewed-token"])
         self.coordinator._api.login.assert_called_once()
 
-    async def test_cancelling_pacing_wait_cannot_send_or_authenticate_another_get(self):
+    async def test_cancelling_pacing_wait_cannot_send_another_get(self):
         await self.coordinator._request_consumptions(START, END, Frequency.DAILY)
         entered = asyncio.Event()
 
@@ -134,7 +141,8 @@ class SharedRequestPacingTests(OfflineTests):
         with self.assertRaises(asyncio.CancelledError):
             await task
         self.coordinator._api.consumptions.assert_called_once()
-        self.coordinator._ensure_token.assert_awaited_once()
+        self.assertEqual(self.coordinator._ensure_token.await_count, 2)
+        self.coordinator._api.login.assert_not_called()
         self.assertFalse(self.coordinator._request_gate["lock"].locked())
 
 
