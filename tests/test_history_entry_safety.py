@@ -396,6 +396,7 @@ class EntrySafetyTests(unittest.IsolatedAsyncioTestCase):
             contract="ONE",
             entry_id=self.entry.entry_id,
             import_old_consumptions=AsyncMock(side_effect=import_data),
+            _set_manual_import_reserved=Mock(),
         )
 
         def create_background(hass, coroutine, name):

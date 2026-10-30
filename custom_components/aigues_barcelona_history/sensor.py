@@ -8,6 +8,7 @@ from functools import partial
 import logging
 import math
 import time
+from time import monotonic
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import (
@@ -21,12 +22,12 @@ from homeassistant.const import (
     CONF_STATE,
     CONF_TOKEN,
     CONF_USERNAME,
-    EVENT_HOMEASSISTANT_START,
     UnitOfVolume,
 )
-from homeassistant.core import CoreState, HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.start import async_at_start
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -58,6 +59,7 @@ from .const import (
     CONF_VALUE,
     DEFAULT_HISTORY_DAYS,
     DOMAIN,
+    IMPORT_PHASES,
     NAME,
 )
 from .settings import effective_settings, validate_history_days
@@ -65,6 +67,7 @@ from .statistics import (
     Frequency,
     build_statistics,
     describe_hourly_coverage,
+    describe_interval_coverage,
     normalize_readings,
     plan_windows,
     reconcile_intervals,
@@ -74,8 +77,22 @@ from .statistics import (
 _LOGGER = logging.getLogger(__name__)
 MAX_FETCH_ATTEMPTS = 5
 MAX_INLINE_RETRY_SECONDS = 60
+MIN_REQUEST_INTERVAL_SECONDS = 1
 # The API's query-date labels and supplied timestamps use fixed CET year round.
 PROVIDER_TIME_ZONE = timezone(timedelta(hours=1))
+
+
+def _empty_import_status():
+    """Return one independent, complete status snapshot for a new import."""
+    return {
+        "phase": "idle",
+        "frequency": None,
+        "current_window_start": None,
+        "current_window_end": None,
+        "completed_windows": 0,
+        "total_windows": 0,
+        "last_error": None,
+    }
 
 
 async def async_setup_entry(hass: HomeAssistant, entry, async_add_entities):
@@ -91,10 +108,7 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_entities):
 
         entry.async_create_background_task(hass, refresh_meters(), f"{DOMAIN} first refresh")
 
-    if hass.state == CoreState.running:
-        first_refresh()
-    else:
-        entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_START, first_refresh))
+    entry.async_on_unload(async_at_start(hass, first_refresh))
 
 
 class AiguesHistoryCoordinator(DataUpdateCoordinator):
@@ -120,11 +134,16 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         self._lock = asyncio.Lock()
         domain_data = hass.data.setdefault(DOMAIN, {})
         self._token_lock = domain_data.setdefault("_token_lock", asyncio.Lock())
+        self._request_gate = domain_data.setdefault(
+            "_request_gate", {"lock": asyncio.Lock(), "next_request_at": 0}
+        )
         self._store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.{self.id}")
         self._ledger = None
         self._stopping = False
+        self._manual_import_reserved = False
         self._data = domain_data.setdefault(self.contract, {})
         self._data["coordinator"] = self
+        self._data["import_status"] = _empty_import_status()
         self._api = AiguesBarcelonaHistoryApiClient(
             entry.data[CONF_USERNAME],
             entry.data.get(CONF_PASSWORD, ""),
@@ -153,6 +172,36 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
     def _assert_active(self) -> None:
         if self._stopping or getattr(self, "_shutdown_requested", False):
             raise asyncio.CancelledError
+
+    @callback
+    def _set_import_status(self, **changes) -> None:
+        """Publish progress to listeners without scheduling another provider fetch."""
+        if "phase" in changes and changes["phase"] not in IMPORT_PHASES:
+            raise ValueError("Invalid History import phase")
+        self._data["import_status"] = {**self._data["import_status"], **changes}
+        if not self._stopping and not getattr(self, "_shutdown_requested", False):
+            self.async_update_listeners()
+
+    @callback
+    def _set_manual_import_reserved(self, reserved: bool) -> None:
+        """Reserve manual work before yielding so repeated clicks cannot queue it."""
+        if reserved:
+            self._assert_active()
+            if self.import_in_progress:
+                raise HomeAssistantError(
+                    "A History import is already running. Wait for it to finish."
+                )
+        self._manual_import_reserved = reserved
+        if not self._stopping and not getattr(self, "_shutdown_requested", False):
+            self.async_update_listeners()
+
+    @property
+    def import_in_progress(self) -> bool:
+        """Keep UI availability and backend duplicate protection consistent."""
+        return self._manual_import_reserved or self._data["import_status"]["phase"] in {
+            "running",
+            "retrying",
+        }
 
     async def async_shutdown(self) -> None:
         """Reject new work and let entry ownership cancel pending imports."""
@@ -242,7 +291,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 saved = {frequency.value: {} for frequency in Frequency}
             self._ledger, _ = self._prepare_statistics(saved)
 
-    async def _wait_for_request(self, backoff: float) -> None:
+    async def _wait_for_request(self, backoff: float, *, minimum_delay: float = 0) -> None:
         while True:
             self._assert_active()
             deadline = self._entry().data.get(CONF_RETRY_NOT_BEFORE, 0)
@@ -252,7 +301,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 or not math.isfinite(deadline)
             ):
                 raise ValueError("Invalid stored provider retry deadline")
-            delay = max(backoff, deadline - time.time())
+            delay = max(backoff, deadline - time.time(), minimum_delay)
             if delay > MAX_INLINE_RETRY_SECONDS:
                 raise AiguesApiRateLimitError(
                     "Provider retry pause is still active", retry_after=delay
@@ -261,9 +310,10 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 return
             await asyncio.sleep(delay)
             backoff = 0
+            minimum_delay = 0
 
     async def _request_consumptions(self, start: date, end: date, frequency: Frequency) -> list:
-        """Retry transient GET errors while honoring provider-requested pauses."""
+        """Pace History GETs and retry transient failures without shortening pauses."""
         request = partial(
             self._api.consumptions,
             start,
@@ -272,49 +322,61 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             frequency=frequency.value,
         )
         for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
-            await self._wait_for_request(0 if attempt == 1 else 2 ** (attempt - 2))
-            try:
-                rows = await self.hass.async_add_executor_job(request)
-                self._assert_active()
-                deadline = self._entry().data.get(CONF_RETRY_NOT_BEFORE, 0)
-                if deadline and deadline <= time.time():
-                    self._update_entry_data(**{CONF_RETRY_NOT_BEFORE: 0})
-                return rows
-            except AiguesApiSessionLimitError as err:
-                raise self._session_limit_failure() from err
-            except (
-                Timeout,
-                ConnectionError,
-                ChunkedEncodingError,
-                AiguesApiServerError,
-                AiguesApiRateLimitError,
-            ) as err:
-                self._assert_active()
-                retry_after = getattr(err, "retry_after", None)
-                if retry_after is not None:
-                    deadline = max(
-                        self._entry().data.get(CONF_RETRY_NOT_BEFORE, 0),
-                        time.time() + retry_after,
-                    )
-                    self._update_entry_data(**{CONF_RETRY_NOT_BEFORE: deadline})
-                if attempt == MAX_FETCH_ATTEMPTS:
-                    raise
-                _LOGGER.warning(
-                    "%s consumption request for %s (%s to %s) failed with %s; attempt %d/%d",
-                    frequency.value,
-                    self.contract,
-                    start,
-                    end,
-                    type(err).__name__,
-                    attempt,
-                    MAX_FETCH_ATTEMPTS,
+            async with self._request_gate["lock"]:
+                await self._wait_for_request(
+                    0 if attempt == 1 else 2 ** (attempt - 2),
+                    minimum_delay=self._request_gate["next_request_at"] - monotonic(),
                 )
+                await self._ensure_token()
+                self._assert_active()
+                try:
+                    rows = await self.hass.async_add_executor_job(request)
+                    self._assert_active()
+                    deadline = self._entry().data.get(CONF_RETRY_NOT_BEFORE, 0)
+                    if deadline and deadline <= time.time():
+                        self._update_entry_data(**{CONF_RETRY_NOT_BEFORE: 0})
+                    self._set_import_status(phase="running", last_error=None)
+                    return rows
+                except AiguesApiSessionLimitError as err:
+                    raise self._session_limit_failure() from err
+                except (
+                    Timeout,
+                    ConnectionError,
+                    ChunkedEncodingError,
+                    AiguesApiServerError,
+                    AiguesApiRateLimitError,
+                ) as err:
+                    self._assert_active()
+                    self._set_import_status(phase="retrying", last_error=type(err).__name__)
+                    retry_after = getattr(err, "retry_after", None)
+                    if retry_after is not None:
+                        deadline = max(
+                            self._entry().data.get(CONF_RETRY_NOT_BEFORE, 0),
+                            time.time() + retry_after,
+                        )
+                        self._update_entry_data(**{CONF_RETRY_NOT_BEFORE: deadline})
+                    if attempt == MAX_FETCH_ATTEMPTS:
+                        raise
+                    _LOGGER.warning(
+                        "%s consumption request for %s (%s to %s) failed with %s; attempt %d/%d",
+                        frequency.value,
+                        self.contract,
+                        start,
+                        end,
+                        type(err).__name__,
+                        attempt,
+                        MAX_FETCH_ATTEMPTS,
+                    )
+                finally:
+                    self._request_gate["next_request_at"] = (
+                        monotonic() + MIN_REQUEST_INTERVAL_SECONDS
+                    )
 
-    async def _fetch(self, start: date, end: date, frequency: Frequency) -> dict:
-        result = {}
+    def _fetch_windows(self, start: date, end: date, frequency: Frequency):
+        """Use one request plan for fetching and visible progress totals."""
         if start >= end:
             plan_windows(start, end, frequency)  # Validate reversed or invalid bounds.
-            return result
+            return []
         # The provider labels hours in fixed CET. Madrid's summer midnight is
         # in the preceding provider date. Fetch that boundary, then filter by
         # the requested HA dates. Keep today's unreliable API response separate.
@@ -322,14 +384,25 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         provider_today = dt_util.now().astimezone(PROVIDER_TIME_ZONE).date()
         query_stop = min(end, provider_today + timedelta(days=1))
         if query_begin >= query_stop:
-            return result
-        windows = plan_windows(
+            return []
+        return plan_windows(
             query_begin,
             query_stop,
             frequency,
             split_at=provider_today,
         )
+
+    async def _fetch(self, start: date, end: date, frequency: Frequency, *, windows=None) -> dict:
+        result = {}
+        windows = self._fetch_windows(start, end, frequency) if windows is None else windows
         for query_start, query_end in windows:
+            self._set_import_status(
+                phase="running",
+                frequency=frequency.value,
+                current_window_start=query_start.isoformat(),
+                current_window_end=query_end.isoformat(),
+                last_error=None,
+            )
             rows = await self._request_consumptions(query_start, query_end, frequency)
             if not isinstance(rows, list):
                 raise ValueError(f"Invalid {frequency.value} response for {query_start}")
@@ -351,6 +424,9 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 startdate=start,
                 enddate=end,
             )
+            self._set_import_status(
+                completed_windows=self._data["import_status"]["completed_windows"] + 1
+            )
         return result
 
     async def _import_range(self, start: date, end: date, frequencies: tuple) -> None:
@@ -359,29 +435,44 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
     async def _import_ranges(self, ranges: dict) -> None:
         """Commit different hourly/reference depths as one validated batch."""
         async with self._lock:
-            self._assert_active()
-            await self._load_ledger()
-            await self._publish()
-            self._update_display()
-            await self._wait_for_request(0)
-            await self._ensure_token()
-            candidate = dict(self._ledger)
-            for frequency, (start, end) in ranges.items():
-                incoming = await self._fetch(start, end, frequency)
-                candidate[frequency.value] = reconcile_intervals(
-                    candidate[frequency.value],
-                    incoming,
-                    frequency,
-                    dt_util.DEFAULT_TIME_ZONE,
-                    startdate=start,
-                    enddate=end,
-                )
-            candidate, _ = self._prepare_statistics(candidate)
-            self._assert_active()
-            await self._store.async_save(candidate)
-            self._ledger = candidate
-            await self._publish()
-            self._update_display()
+            plans = {
+                frequency: self._fetch_windows(start, end, frequency)
+                for frequency, (start, end) in ranges.items()
+            }
+            self._data["import_status"] = _empty_import_status()
+            self._set_import_status(
+                phase="running", total_windows=sum(len(windows) for windows in plans.values())
+            )
+            try:
+                self._assert_active()
+                await self._load_ledger()
+                await self._publish()
+                self._update_display()
+                # Verified cached readings remain useful while a long import runs.
+                self.async_set_updated_data(self._data)
+                await self._wait_for_request(0)
+                candidate = dict(self._ledger)
+                for frequency, (start, end) in ranges.items():
+                    incoming = await self._fetch(start, end, frequency, windows=plans[frequency])
+                    candidate[frequency.value] = reconcile_intervals(
+                        candidate[frequency.value],
+                        incoming,
+                        frequency,
+                        dt_util.DEFAULT_TIME_ZONE,
+                        startdate=start,
+                        enddate=end,
+                    )
+                candidate, _ = self._prepare_statistics(candidate)
+                self._assert_active()
+                await self._store.async_save(candidate)
+                self._ledger = candidate
+                await self._publish()
+                self._update_display()
+            except (Exception, asyncio.CancelledError) as err:
+                self._set_import_status(phase="failed", last_error=type(err).__name__)
+                raise
+            else:
+                self._set_import_status(phase="completed", last_error=None)
 
     async def _statistics_snapshot(self, frequency, points):
         statistic_id = self.statistic_ids[frequency]
@@ -483,6 +574,9 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         self._data["hourly_coverage"] = describe_hourly_coverage(
             self._ledger[Frequency.HOURLY.value], dt_util.DEFAULT_TIME_ZONE
         )
+        self._data["provider_daily_coverage"] = describe_interval_coverage(
+            self._ledger[Frequency.DAILY.value]
+        )
 
     async def import_old_consumptions(
         self, days: int = DEFAULT_HISTORY_DAYS, frequency: str = "ALL"
@@ -568,4 +662,6 @@ class AiguesHistoryMeter(CoordinatorEntity, SensorEntity):
             "statistics": self.coordinator._data.get("statistics", {}),
             "imported_intervals": self.coordinator._data.get("imported_intervals", {}),
             "hourly_coverage": self.coordinator._data.get("hourly_coverage", {}),
+            "provider_daily_coverage": self.coordinator._data.get("provider_daily_coverage", {}),
+            "import_status": self.coordinator._data.get("import_status", _empty_import_status()),
         }

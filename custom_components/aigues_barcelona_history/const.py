@@ -14,6 +14,7 @@ CONF_HOURLY_HISTORY_DAYS = "hourly_history_days"
 CONF_SCAN_INTERVAL_MINUTES = "scan_interval_minutes"
 
 ATTR_LAST_MEASURE = "Last measure"
+IMPORT_PHASES = frozenset({"idle", "running", "retrying", "completed", "failed"})
 
 DEFAULT_SCAN_PERIOD = 3600 + 300
 CONF_SCAN_PERIOD = "scan_period"

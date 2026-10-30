@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.2 — 2026-10-30
+
+- Fix startup-listener cleanup during reload and unloading.
+- Show import progress, completion and failures while preserving cached readings.
+- Reject duplicate manual imports instead of silently queuing another backfill.
+- Pace consumption requests and check token expiry between historical windows.
+- Expose daily-reference coverage alongside hourly coverage.
+- Document separate monthly reference and recent hourly history views.
+
 ## 0.4.1 — 2026-10-30
 
 First standalone public History release.

@@ -390,6 +390,7 @@ class ObservedSessionLimitCoordinatorTests(OfflineTests):
 
     async def test_actual_consumption_code_also_persists_guard_without_buying_a_solution(self):
         session = self.bind_client(self.coordinator, status=200)
+        self.coordinator._api.is_token_expired = Mock(return_value=False)
         with self.assertRaises((AiguesApiSessionLimitError, ConfigEntryAuthFailed)):
             await self.coordinator._request_consumptions(
                 date(2026, 10, 27), date(2026, 10, 28), Frequency.HOURLY
