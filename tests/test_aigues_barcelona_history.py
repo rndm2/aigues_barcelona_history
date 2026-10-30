@@ -101,6 +101,7 @@ def make_coordinator(store=None):
     coordinator.energy_statistic_id = ENERGY_ID
     coordinator._energy_hourly_since = None
     coordinator._energy_projection_initialized = False
+    coordinator._hourly_backfill_attempts = {}
     coordinator.entry_id = entry.entry_id
     coordinator._data = {"import_status": sensor._empty_import_status()}
     coordinator._ledger = None
@@ -223,6 +224,7 @@ class CoordinatorLedgerTests(OfflineTests):
                 "hourly_replay_pending",
                 "energy_projection_version",
                 "energy_hourly_since",
+                "hourly_backfill_attempts",
             },
         )
         self.assertEqual(store.saved["hourly_interval_version"], 2)

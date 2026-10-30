@@ -51,6 +51,12 @@ from .api import (
     AiguesApiSessionLimitError,
     AiguesBarcelonaHistoryApiClient,
 )
+from .backfill import (
+    MAX_HOURLY_BACKFILL_REQUESTS,
+    REGULAR_HOURLY_LOOKBACK_DAYS,
+    plan_hourly_backfill,
+    validate_hourly_backfill_attempts,
+)
 from .const import (
     ATTR_LAST_MEASURE,
     CONF_2CAPTCHA_APIKEY,
@@ -86,6 +92,7 @@ from .statistics import (
     initial_energy_hourly_since,
     migrate_legacy_hourly_ledger,
     normalize_readings,
+    pending_hourly_provider_days,
     plan_windows,
     reconcile_intervals,
     validate_saved_ledger,
@@ -150,6 +157,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         self.energy_statistic_id = f"{DOMAIN}:{self.id}_energy_consumption"
         self._energy_hourly_since = None
         self._energy_projection_initialized = False
+        self._hourly_backfill_attempts = {}
         self.entry_id = entry.entry_id
         self._should_import_history = settings[CONF_SHOULD_IMPORT_HISTORY]
         self._lock = asyncio.Lock()
@@ -371,10 +379,11 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             else:
                 today = dt_util.now().date()
                 await self._import_range(
-                    today - timedelta(days=7),
+                    today - timedelta(days=REGULAR_HOURLY_LOOKBACK_DAYS),
                     today + timedelta(days=1),
                     tuple(Frequency),
                 )
+                await self._recheck_incomplete_hours()
         except AiguesApiAuthError as err:
             raise ConfigEntryAuthFailed from err
         except ConfigEntryAuthFailed:
@@ -403,6 +412,14 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 saved = {frequency.value: {} for frequency in Frequency}
             if not isinstance(saved, dict):
                 raise ValueError("Saved History intervals must be a mapping")
+            try:
+                self._hourly_backfill_attempts = validate_hourly_backfill_attempts(
+                    saved.get("hourly_backfill_attempts", {})
+                )
+            except ValueError:
+                # Scheduling metadata is recoverable independently of readings.
+                self._hourly_backfill_attempts = {}
+                _LOGGER.warning("Reset invalid saved hourly backfill scheduling metadata")
             energy_version = saved.get("energy_projection_version")
             if energy_version is None and self.energy_statistic_id in await self._stored_metadata():
                 raise ValueError(
@@ -456,7 +473,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                     await self._save_ledger(candidate)
             self._ledger = candidate
 
-    async def _save_ledger(self, ledger, *, replay_pending=None) -> None:
+    async def _save_ledger(self, ledger, *, replay_pending=None, backfill_attempts=None) -> None:
         """Persist source intervals and replay state together before recorder writes."""
         if replay_pending is None:
             replay_pending = getattr(self, "_hourly_replay_pending", False)
@@ -467,12 +484,27 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             since = initial_energy_hourly_since(
                 ledger[Frequency.HOURLY.value], dt_util.DEFAULT_TIME_ZONE
             )
+        attempts = validate_hourly_backfill_attempts(
+            self._hourly_backfill_attempts if backfill_attempts is None else backfill_attempts
+        )
+        pending = {
+            day.isoformat()
+            for day in pending_hourly_provider_days(
+                ledger[Frequency.DAILY.value],
+                ledger[Frequency.HOURLY.value],
+                dt_util.DEFAULT_TIME_ZONE,
+                hourly_since=since,
+                current_provider_date=dt_util.now().astimezone(PROVIDER_TIME_ZONE).date(),
+            )
+        }
+        attempts = {day: attempted_at for day, attempted_at in attempts.items() if day in pending}
         saved = {
             **ledger,
             "hourly_interval_version": HOURLY_INTERVAL_VERSION,
             "hourly_replay_pending": replay_pending,
             "energy_projection_version": ENERGY_PROJECTION_VERSION,
             "energy_hourly_since": (since.isoformat() if since else None),
+            "hourly_backfill_attempts": attempts,
         }
         if replay_pending:
             saved["hourly_replay_source_sha256"] = self._hourly_source_sha256(
@@ -482,6 +514,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         self._hourly_replay_pending = replay_pending
         self._energy_hourly_since = since
         self._energy_projection_initialized = True
+        self._hourly_backfill_attempts = attempts
 
     @staticmethod
     def _hourly_source_sha256(hourly_ledger) -> str:
@@ -568,7 +601,15 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             )
             self._update_entry_data(**{CONF_RETRY_NOT_BEFORE: deadline})
 
-    async def _request_consumptions(self, start: date, end: date, frequency: Frequency) -> list:
+    async def _request_consumptions(
+        self,
+        start: date,
+        end: date,
+        frequency: Frequency,
+        *,
+        max_attempts: int = MAX_FETCH_ATTEMPTS,
+        on_attempt=None,
+    ) -> list:
         """Pace History GETs and retry transient failures without shortening pauses."""
         request = partial(
             self._api.consumptions,
@@ -577,11 +618,15 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             self.contract,
             frequency=frequency.value,
         )
-        for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+        if type(max_attempts) is not int or not 1 <= max_attempts <= MAX_FETCH_ATTEMPTS:
+            raise ValueError("Invalid consumption request attempt limit")
+        for attempt in range(1, max_attempts + 1):
             await self._wait_for_request(0 if attempt == 1 else 2 ** (attempt - 2))
             async with self._authenticated_request_slot():
                 self._assert_active()
                 try:
+                    if on_attempt is not None:
+                        on_attempt()
                     rows = await self.hass.async_add_executor_job(request)
                     self._assert_active()
                     deadline = self._entry().data.get(CONF_RETRY_NOT_BEFORE, 0)
@@ -601,7 +646,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                     self._assert_active()
                     self._set_import_status(phase="retrying", last_error=type(err).__name__)
                     self._persist_retry_pause(err)
-                    if attempt == MAX_FETCH_ATTEMPTS:
+                    if attempt == max_attempts:
                         raise
                     _LOGGER.warning(
                         "%s consumption request for %s (%s to %s) failed with %s; attempt %d/%d",
@@ -611,8 +656,116 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                         end,
                         type(err).__name__,
                         attempt,
-                        MAX_FETCH_ATTEMPTS,
+                        max_attempts,
                     )
+
+    async def _recheck_incomplete_hours(self) -> None:
+        """Retry a bounded old backlog after fresh readings are already durable."""
+        async with self._lock:
+            self._assert_active()
+            if self._manual_import_reserved:
+                return
+            await self._load_ledger()
+            now = dt_util.now()
+            provider_today = now.astimezone(PROVIDER_TIME_ZONE).date()
+            pending = pending_hourly_provider_days(
+                self._ledger[Frequency.DAILY.value],
+                self._ledger[Frequency.HOURLY.value],
+                dt_util.DEFAULT_TIME_ZONE,
+                hourly_since=self._energy_hourly_since,
+                current_provider_date=provider_today,
+            )
+            selected = plan_hourly_backfill(
+                pending,
+                self._hourly_backfill_attempts,
+                now=now.timestamp(),
+                current_provider_date=provider_today,
+            )
+            status = {
+                "pending_days": len(pending),
+                "request_limit": MAX_HOURLY_BACKFILL_REQUESTS,
+                "attempted_requests": 0,
+                "completed_days": 0,
+                "last_error": None,
+            }
+            self._data["hourly_reconciliation"] = status
+            original_status = dict(self._data["import_status"])
+            try:
+                for day in selected:
+                    self._assert_active()
+                    if self._manual_import_reserved:
+                        break
+                    self._set_import_status(
+                        phase="running",
+                        frequency=Frequency.HOURLY.value,
+                        current_window_start=day.isoformat(),
+                        current_window_end=(day + timedelta(days=1)).isoformat(),
+                    )
+                    attempted = False
+
+                    def mark_attempt():
+                        nonlocal attempted
+                        attempted = True
+
+                    candidate = dict(self._ledger)
+                    error = None
+                    try:
+                        rows = await self._request_consumptions(
+                            day,
+                            day + timedelta(days=1),
+                            Frequency.HOURLY,
+                            max_attempts=1,
+                            on_attempt=mark_attempt,
+                        )
+                        incoming = normalize_readings(
+                            rows,
+                            Frequency.HOURLY,
+                            dt_util.DEFAULT_TIME_ZONE,
+                            provider_date=day,
+                        )
+                        # The exact provider-date filter owns the correction scope.
+                        candidate[Frequency.HOURLY.value] = (
+                            candidate[Frequency.HOURLY.value] | incoming
+                        )
+                        candidate, _ = self._prepare_statistics(candidate)
+                    except AiguesApiAuthError, ConfigEntryAuthFailed:
+                        raise
+                    except (AiguesApiError, RequestException, ValueError) as err:
+                        candidate = dict(self._ledger)
+                        error = err
+                        status["last_error"] = type(err).__name__
+                        _LOGGER.warning(
+                            "Deferred hourly backfill for %s (%s): %s",
+                            self.contract,
+                            day,
+                            type(err).__name__,
+                        )
+                    self._assert_active()
+                    if attempted:
+                        status["attempted_requests"] += 1
+                        attempts = {
+                            **self._hourly_backfill_attempts,
+                            day.isoformat(): dt_util.now().timestamp(),
+                        }
+                        await self._save_ledger(candidate, backfill_attempts=attempts)
+                        self._ledger = candidate
+                        await self._publish()
+                        self._update_display()
+                        still_pending = pending_hourly_provider_days(
+                            candidate[Frequency.DAILY.value],
+                            candidate[Frequency.HOURLY.value],
+                            dt_util.DEFAULT_TIME_ZONE,
+                            hourly_since=self._energy_hourly_since,
+                            current_provider_date=provider_today,
+                        )
+                        status["completed_days"] += int(day not in still_pending)
+                        status["pending_days"] = len(still_pending)
+                    if isinstance(error, AiguesApiRateLimitError) or not attempted:
+                        break
+            finally:
+                self._data["import_status"] = original_status
+                if not self._stopping and not getattr(self, "_shutdown_requested", False):
+                    self.async_update_listeners()
 
     def _fetch_windows(self, start: date, end: date, frequency: Frequency):
         """Use one request plan for fetching and visible progress totals."""
@@ -964,4 +1117,5 @@ class AiguesHistoryMeter(CoordinatorEntity, SensorEntity):
             "provider_daily_coverage": self.coordinator._data.get("provider_daily_coverage", {}),
             "energy_coverage": self.coordinator._data.get("energy_coverage", {}),
             "import_status": self.coordinator._data.get("import_status", _empty_import_status()),
+            "hourly_reconciliation": self.coordinator._data.get("hourly_reconciliation", {}),
         }

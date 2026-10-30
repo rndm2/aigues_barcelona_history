@@ -156,6 +156,11 @@ def _start_of_local_day(day: date, timezone: tzinfo) -> datetime:
     return datetime.combine(day, time.min, tzinfo=timezone).astimezone(UTC)
 
 
+def _provider_date(observed_at):
+    """Use the provider's fixed-CET date for actual closing readings."""
+    return observed_at.astimezone(PROVIDER_TIME_ZONE).date()
+
+
 def canonical_start(observed_at: datetime, frequency, timezone: tzinfo):
     """Use one interval rule for provider responses and persisted source data."""
     frequency = _frequency(frequency)
@@ -184,7 +189,9 @@ def _in_window(observed_at, frequency, timezone, startdate, enddate):
     )
 
 
-def normalize_readings(raw, frequency, timezone: tzinfo, *, startdate=None, enddate=None):
+def normalize_readings(
+    raw, frequency, timezone: tzinfo, *, startdate=None, enddate=None, provider_date=None
+):
     """Return a serialized ledger of validated, independently reported intervals.
 
     DAILY uses the provider's date label at midnight in the supplied business
@@ -194,6 +201,8 @@ def normalize_readings(raw, frequency, timezone: tzinfo, *, startdate=None, endd
     conflicting values is rejected.
     Optional bounds select a half-open range of HA dates for HOURLY, or
     provider calendar-date labels for the separate DAILY reference.
+    An optional HOURLY provider date selects one complete fixed-CET closing
+    block, including its actual intervals on the preceding HA date in winter.
     Every row is validated before filtering, while out-of-range rows cannot
     replace an in-range observation during bucket consolidation.
     """
@@ -201,6 +210,9 @@ def normalize_readings(raw, frequency, timezone: tzinfo, *, startdate=None, endd
     if not isinstance(timezone, tzinfo):
         raise ValueError("A timezone is required")
     _validate_bounds(startdate, enddate, optional=True)
+    _validate_bounds(provider_date, provider_date, optional=True)
+    if provider_date is not None and frequency is not Frequency.HOURLY:
+        raise ValueError("A provider-date filter is only valid for HOURLY readings")
     if not isinstance(raw, Iterable) or isinstance(raw, (str, bytes, Mapping)):
         raise ValueError("Readings must be an iterable of mappings")
     ledger = {}
@@ -219,6 +231,8 @@ def normalize_readings(raw, frequency, timezone: tzinfo, *, startdate=None, endd
             state,
             delta,
         )
+        if provider_date is not None and _provider_date(observed_at) != provider_date:
+            continue
         if not _in_window(observed_at, frequency, timezone, startdate, enddate):
             continue
         _insert(ledger, record)
@@ -450,12 +464,20 @@ def build_legacy_daily_prefix(native_rows, daily, timezone, *, statistic_id):
     return prefix, summary
 
 
+def _daily_provider_reports(daily, timezone):
+    """Daily observations retain their provider date label rather than an instant date."""
+    return {
+        _aware_datetime(record["observed_at"], "observed_at").date(): record
+        for record in validate_saved_ledger(daily, Frequency.DAILY, timezone).values()
+    }
+
+
 def _provider_hourly_blocks(hourly, timezone):
     """Partition actual intervals by the fixed-CET date of their closing hour."""
     blocks = defaultdict(dict)
     for key, record in validate_saved_ledger(hourly, Frequency.HOURLY, timezone).items():
         start = _aware_datetime(record["start"], "start")
-        provider_day = (start + HOURLY_INTERVAL).astimezone(PROVIDER_TIME_ZONE).date()
+        provider_day = _provider_date(start + HOURLY_INTERVAL)
         blocks[provider_day][key] = record
     return blocks
 
@@ -482,6 +504,28 @@ def initial_energy_hourly_since(hourly, timezone):
     blocks = _provider_hourly_blocks(hourly, timezone)
     complete = [day for day, rows in blocks.items() if len(rows) == PROVIDER_DAY_HOURS]
     return min(complete or blocks, default=None)
+
+
+def pending_hourly_provider_days(daily, hourly, timezone, *, hourly_since, current_provider_date):
+    """Return every closed provider block still needing reported hours.
+
+    A known partial hourly block remains eligible at any age, including before
+    the Energy detail frontier. Daily-known dates without hours are eligible
+    only at or after that frontier. Ancient intentionally coarse daily history
+    is therefore not expanded into an unbounded initial download. This list is
+    independent of the Energy fallback policy and is never truncated for attrs.
+    """
+    _validate_bounds(hourly_since, hourly_since, optional=True)
+    _validate_bounds(current_provider_date, current_provider_date)
+    reports = _daily_provider_reports(daily, timezone)
+    blocks = _provider_hourly_blocks(hourly, timezone)
+    return [
+        day
+        for day in sorted(reports.keys() | blocks.keys())
+        if day < current_provider_date
+        and len(blocks.get(day, {})) < PROVIDER_DAY_HOURS
+        and (day in blocks or (hourly_since is not None and day >= hourly_since))
+    ]
 
 
 def build_energy_projection(
@@ -516,12 +560,8 @@ def build_energy_projection(
     _validate_bounds(current_provider_date, current_provider_date, optional=True)
     if not isinstance(use_daily_totals_for_incomplete, bool):
         raise ValueError("The incomplete-day policy must be a boolean")
-    daily = validate_saved_ledger(daily, Frequency.DAILY, timezone)
+    daily_by_day = _daily_provider_reports(daily, timezone)
     blocks = _provider_hourly_blocks(hourly, timezone)
-    daily_by_day = {
-        _aware_datetime(record["observed_at"], "observed_at").date(): record
-        for record in daily.values()
-    }
     projection = {}
     coverage = {
         "hourly_since": hourly_since.isoformat() if hourly_since is not None else None,
