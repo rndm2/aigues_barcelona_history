@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.1 — 2026-10-30
+
+- Retry incomplete older hourly reporting blocks without an age cutoff.
+- Persist fair age-based scheduling, capped at two additional consumption attempts per refresh.
+- Isolate old-request failures after recent readings are committed and preserve shared provider pacing and retry pauses.
+- Reconcile exact provider dates, including their winter boundary hour on the preceding HA date.
+
 ## 0.5.0 — 2026-10-30
 
 - Add one Energy statistic combining older daily aggregates with complete reported hours.

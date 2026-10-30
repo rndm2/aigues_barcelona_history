@@ -97,8 +97,23 @@ coverage. The configured initial request switches off after both imports succeed
 for every contract. An empty valid response can complete a request without
 providing the requested history.
 
-Regular refreshes revisit **seven past days plus today**. They do not repeat the
-entire configured range. Use a button for older gaps or provider corrections.
+Regular refreshes revisit **seven past days plus today**. They also retry known
+incomplete older hourly reporting blocks without an age cutoff. Each refresh
+allows at most two additional consumption GET attempts per meter, with the
+oldest actual attempt served first. Days aged 8–30 are eligible daily, 31–180
+weekly, and older days every 30 days. The attempt times survive restarts.
+
+The backlog includes every known partial hourly block and missing blocks within
+the detailed-history range. Older daily-only history remains compressed. A
+valid empty response keeps its day pending. Returned hours are merged and can
+correct saved values only within the requested provider date. An old request
+failure does not discard the already committed recent readings. Backlog calls
+share the normal request pacing and provider retry pauses; each scheduled old
+attempt performs one consumption GET, while normal request retries are unchanged.
+The sensor's `hourly_reconciliation` attribute reports pending days, attempts,
+completed blocks and the latest background error class.
+
+Use a button for older complete-day corrections or to revisit a larger range.
 Changing settings reloads the entry; normal expired-token recovery still applies.
 
 The meter's `import_status` attribute reports the current phase, request window
