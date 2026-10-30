@@ -5,20 +5,28 @@ retained for audit, but converting the instant must not move a daily aggregate
 into another labelled day. HOURLY timestamps identify meter readings at the end
 of consumption intervals. HA statistic starts identify the preceding UTC hour.
 
-Each frequency has its own ledger. Mixing DAILY and HOURLY ledgers would count
-the same consumption twice and is the caller's responsibility to prevent.
+Each frequency has its own source ledger. The derived Energy projection selects
+one precision for each provider day, without changing or adding source readings.
 """
 
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime, time, timedelta, tzinfo
 from datetime import timezone as datetime_timezone
 from decimal import Decimal
 from enum import Enum
+import hashlib
+import json
 import math
+import re
 
 UTC = datetime_timezone.utc
 HOURLY_INTERVAL = timedelta(hours=1)
+PROVIDER_TIME_ZONE = datetime_timezone(timedelta(hours=1))
+PROVIDER_DAY_HOURS = 24
+ENERGY_COVERAGE_RECENT_DATES = 14
+LEGACY_ARCHIVE_MIN_OVERLAP_DAYS = 3
+_MISSING = object()
 
 
 class Frequency(str, Enum):
@@ -59,16 +67,59 @@ def _number(value, field):
     return result
 
 
-def _record(start, observed_at, state, delta):
+def _source_sha256(value):
+    serialized = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _native_statistic_id(value):
+    if not isinstance(value, str) or re.fullmatch(r"sensor\.[a-z0-9_]+", value) is None:
+        raise ValueError("Archive provenance requires a native sensor statistic ID")
+    return value
+
+
+def _archive_origin(value):
+    fields = {"type", "statistic_id", "start", "row_sha256", "previous_state"}
+    if not isinstance(value, Mapping) or value.keys() != fields:
+        raise ValueError("Archive origin must contain only the approved provenance fields")
+    if value["type"] != "recorder_archive":
+        raise ValueError("Unsupported ledger origin")
+    _native_statistic_id(value["statistic_id"])
+    _aware_datetime(value["start"], "origin.start")
+    digest = value["row_sha256"]
+    if not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None:
+        raise ValueError("Archive origin requires a lowercase SHA256 row digest")
+    return {
+        **{key: value[key] for key in ("type", "statistic_id", "start", "row_sha256")},
+        "previous_state": _number(value["previous_state"], "origin.previous_state"),
+    }
+
+
+def _record(start, observed_at, state, delta, *, origin=_MISSING):
     start = start.astimezone(UTC)
     if start.minute or start.second or start.microsecond:
         raise ValueError("Ledger starts must be aligned to a UTC hour")
-    return {
+    record = {
         "start": start.isoformat(),
         "observed_at": observed_at.isoformat(),
         "state": _number(state, "accumulatedConsumption"),
         "delta": _number(delta, "deltaConsumption"),
     }
+    if origin is not _MISSING:
+        record["origin"] = _archive_origin(origin)
+        original_row = {
+            "start": record["origin"]["start"],
+            "state": record["state"],
+            "sum": record["state"],
+        }
+        if record["origin"]["row_sha256"] != _source_sha256(original_row):
+            raise ValueError("Archive source row digest does not match its meter reading")
+        verified_delta = Decimal(str(record["state"])) - Decimal(
+            str(record["origin"]["previous_state"])
+        )
+        if verified_delta < 0 or verified_delta != Decimal(str(record["delta"])):
+            raise ValueError("Archived consumption must match its verified meter difference")
+    return record
 
 
 def _insert(ledger, record, *, allow_correction=False):
@@ -83,7 +134,9 @@ def _insert(ledger, record, *, allow_correction=False):
     if incoming_time > previous_time or (allow_correction and incoming_time == previous_time):
         ledger[key] = record
     elif incoming_time == previous_time and (
-        record["state"] != current["state"] or record["delta"] != current["delta"]
+        record["state"] != current["state"]
+        or record["delta"] != current["delta"]
+        or record.get("origin") != current.get("origin")
     ):
         raise ValueError(f"Conflicting readings for the same observation at {key}")
 
@@ -191,7 +244,13 @@ def merge_ledgers(*ledgers):
             try:
                 start = _aware_datetime(value["start"], "start")
                 observed_at = _aware_datetime(value["observed_at"], "observed_at")
-                record = _record(start, observed_at, value["state"], value["delta"])
+                record = _record(
+                    start,
+                    observed_at,
+                    value["state"],
+                    value["delta"],
+                    origin=value.get("origin", _MISSING),
+                )
             except KeyError as error:
                 raise ValueError(f"Ledger entry is missing {error.args[0]}") from error
             if _aware_datetime(key, "ledger key").astimezone(UTC) != start:
@@ -210,6 +269,19 @@ def validate_saved_ledger(ledger, frequency, timezone: tzinfo):
     canonical = merge_ledgers(ledger)
     for record in canonical.values():
         observed_at = _aware_datetime(record["observed_at"], "observed_at")
+        if "origin" in record:
+            native_day = (
+                _aware_datetime(record["origin"]["start"], "origin.start")
+                .astimezone(timezone)
+                .date()
+            )
+            midnight = datetime.combine(observed_at.date(), time.min, tzinfo=timezone)
+            if (
+                frequency is not Frequency.DAILY
+                or native_day != observed_at.date()
+                or observed_at != midnight
+            ):
+                raise ValueError("Archived daily origin must match its HA date and midnight label")
         expected = canonical_start(observed_at, frequency, timezone)
         if _aware_datetime(record["start"], "start") != expected:
             raise ValueError(
@@ -258,6 +330,255 @@ def reconcile_intervals(current, incoming, frequency, timezone, *, startdate, en
     if frequency is Frequency.DAILY:
         return merge_ledgers(result, selected)
     return result | selected
+
+
+def build_legacy_daily_prefix(native_rows, daily, timezone, *, statistic_id):
+    """Archive only verified native daily increments preceding API history.
+
+    This pure, one-time migration accepts explicitly supplied recorder rows.
+    It never reads the original integration or its database. The first native
+    value is an unknown lifetime baseline and is never imported as consumption.
+    Every following HA calendar date must be unique, contiguous and monotonic,
+    with state equal to sum. At least three consecutive overlap days must match
+    actual API daily states and reported deltas before any prefix is returned.
+
+    Archives retain the preceding meter state, native timestamp and a digest of
+    canonical validated JSON containing its start, state and sum. Their daily
+    observation is local midnight, allowing later API observations to supersede
+    the archived record. The summary is private migration evidence, not attrs.
+    """
+    statistic_id = _native_statistic_id(statistic_id)
+    known = validate_saved_ledger(daily, Frequency.DAILY, timezone)
+    api = {
+        _aware_datetime(row["observed_at"], "observed_at").date(): row
+        for row in known.values()
+        if "origin" not in row
+    }
+    if not api:
+        raise ValueError("Actual API daily history is required to validate the archive bridge")
+    first_api_day = min(api)
+    if not isinstance(native_rows, Iterable) or isinstance(native_rows, (str, bytes, Mapping)):
+        raise ValueError("Native rows must be an iterable of mappings")
+    rows = []
+    for value in native_rows:
+        if not isinstance(value, Mapping):
+            raise ValueError("Each native row must be a mapping")
+        try:
+            observed = _aware_datetime(value["start"], "native.start")
+            row = {
+                "start": value["start"],
+                "state": _number(value["state"], "native.state"),
+                "sum": _number(value["sum"], "native.sum"),
+            }
+        except KeyError as error:
+            raise ValueError(f"Native row is missing {error.args[0]}") from error
+        if row["state"] != row["sum"]:
+            raise ValueError("Native state and sum must match before archive import")
+        rows.append((observed.astimezone(timezone).date(), row))
+    rows.sort(key=lambda item: item[0])
+    if len(rows) < LEGACY_ARCHIVE_MIN_OVERLAP_DAYS + 1:
+        raise ValueError("Insufficient native rows for an independent API overlap")
+
+    prefix = {}
+    matches = []
+    total = Decimal(0)
+    for (previous_day, previous), (day, row) in zip(rows, rows[1:]):
+        if day != previous_day + timedelta(days=1):
+            raise ValueError("Native calendar dates must be unique and contiguous")
+        delta = Decimal(str(row["state"])) - Decimal(str(previous["state"]))
+        if delta < 0:
+            raise ValueError("Native meter reset or negative consumption cannot be archived")
+        if day in api:
+            reference = api[day]
+            if Decimal(str(row["state"])) != Decimal(str(reference["state"])) or delta != Decimal(
+                str(reference["delta"])
+            ):
+                raise ValueError("Native/API overlap state or consumption does not match")
+            matches.append(day)
+        if day >= first_api_day:
+            continue
+        observation = datetime.combine(day, time.min, tzinfo=timezone)
+        point = _record(
+            canonical_start(observation, Frequency.DAILY, timezone),
+            observation,
+            row["state"],
+            delta,
+            origin={
+                "type": "recorder_archive",
+                "statistic_id": statistic_id,
+                "start": row["start"],
+                "row_sha256": _source_sha256(row),
+                "previous_state": previous["state"],
+            },
+        )
+        _insert(prefix, point)
+        total += delta
+    overlap_span = LEGACY_ARCHIVE_MIN_OVERLAP_DAYS - 1
+    if not any(
+        matches[index] - matches[index - overlap_span] == timedelta(days=overlap_span)
+        for index in range(overlap_span, len(matches))
+    ):
+        raise ValueError("At least three consecutive matching API overlap days are required")
+    baseline_day, baseline = rows[0]
+    if baseline_day in api and Decimal(str(baseline["state"])) != Decimal(
+        str(api[baseline_day]["state"])
+    ):
+        raise ValueError("Native/API baseline overlap state does not match")
+    prefix = validate_saved_ledger(prefix, Frequency.DAILY, timezone)
+    imported_days = sorted(
+        _aware_datetime(row["observed_at"], "observed_at").date().isoformat()
+        for row in prefix.values()
+    )
+    summary = {
+        "statistic_id": statistic_id,
+        "native_rows": len(rows),
+        "source_sha256": _source_sha256([row for _, row in rows]),
+        "baseline": {
+            "day": baseline_day.isoformat(),
+            **baseline,
+            "row_sha256": _source_sha256(baseline),
+            "consumption_imported": False,
+        },
+        "first_api_day": first_api_day.isoformat(),
+        "matching_overlap_days": len(matches),
+        "overlap_dates": [day.isoformat() for day in matches],
+        "imported_days": len(prefix),
+        "first_imported_day": imported_days[0] if imported_days else None,
+        "last_imported_day": imported_days[-1] if imported_days else None,
+        "imported_consumption_m3": _number(total, "archived consumption"),
+    }
+    return prefix, summary
+
+
+def _provider_hourly_blocks(hourly, timezone):
+    """Partition actual intervals by the fixed-CET date of their closing hour."""
+    blocks = defaultdict(dict)
+    for key, record in validate_saved_ledger(hourly, Frequency.HOURLY, timezone).items():
+        start = _aware_datetime(record["start"], "start")
+        provider_day = (start + HOURLY_INTERVAL).astimezone(PROVIDER_TIME_ZONE).date()
+        blocks[provider_day][key] = record
+    return blocks
+
+
+def _provider_block_last_start(day, timezone):
+    """Anchor a coarse provider day inside its own actual 24-hour block.
+
+    End-reading labels 00 through 23 in fixed CET close intervals starting at
+    23 on the previous provider date through 22 on this date. In Madrid the
+    final interval starts at 23 in summer or 22 in winter. It is also one of
+    the actual hourly keys when that provider block becomes complete.
+    """
+    closing_reading = datetime.combine(day, time(hour=23), tzinfo=PROVIDER_TIME_ZONE)
+    return canonical_start(closing_reading, Frequency.HOURLY, timezone)
+
+
+def initial_energy_hourly_since(hourly, timezone):
+    """Choose an initial provider-date frontier; the caller persists it once.
+
+    Prefer the earliest complete provider block so an initial partial day can
+    use its whole-day report. A later backfill must not recompute this setting.
+    Complete older islands are selected independently by the projection.
+    """
+    blocks = _provider_hourly_blocks(hourly, timezone)
+    complete = [day for day, rows in blocks.items() if len(rows) == PROVIDER_DAY_HOURS]
+    return min(complete or blocks, default=None)
+
+
+def build_energy_projection(
+    daily,
+    hourly,
+    timezone,
+    *,
+    hourly_since,
+    use_daily_totals_for_incomplete=True,
+):
+    """Select actual hours or one explicitly coarse total per provider block.
+
+    The two inputs remain authoritative, independent source ledgers. A complete
+    block always uses its actual hours, even before the persisted frontier.
+    Otherwise a daily report can replace the entire incomplete block, never
+    coexist with its partial hours or distribute a residual across invented
+    hours. With the optional policy disabled, recent partial blocks retain
+    their actual hours; old partial blocks and days without any hours still
+    use available daily reports. A daily amount below known hourly consumption
+    is contradictory, so actual hours win and the disagreement is exposed.
+
+    Coarse dates describe provider reporting periods, not measured hourly use.
+    Their physical block boundaries remain fixed CET through Madrid DST. This
+    prevents overlap at a winter coarse/fine handoff. The returned projection
+    is a derived ledger for ``build_statistics``, not a new HOURLY source ledger.
+    """
+    _validate_bounds(hourly_since, hourly_since, optional=True)
+    if not isinstance(use_daily_totals_for_incomplete, bool):
+        raise ValueError("The incomplete-day policy must be a boolean")
+    daily = validate_saved_ledger(daily, Frequency.DAILY, timezone)
+    blocks = _provider_hourly_blocks(hourly, timezone)
+    daily_by_day = {
+        _aware_datetime(record["observed_at"], "observed_at").date(): record
+        for record in daily.values()
+    }
+    projection = {}
+    coverage = {
+        "hourly_since": hourly_since.isoformat() if hourly_since is not None else None,
+        "use_daily_totals_for_incomplete": use_daily_totals_for_incomplete,
+        "daily_aggregate_dates": [],
+        "reported_hours": 0,
+        "suppressed_reported_hours": 0,
+        "complete_hourly_blocks": 0,
+        "incomplete_provider_dates": {},
+        "disagreement_dates": [],
+    }
+    for day in sorted(daily_by_day.keys() | blocks.keys()):
+        hours = blocks.get(day, {})
+        complete = len(hours) == PROVIDER_DAY_HOURS
+        coverage["complete_hourly_blocks"] += int(complete)
+        report = daily_by_day.get(day)
+        known_amount = sum((Decimal(str(row["delta"])) for row in hours.values()), Decimal(0))
+        daily_amount = Decimal(str(report["delta"])) if report is not None else None
+        contradicts_known = daily_amount is not None and daily_amount < known_amount
+        if contradicts_known or (complete and daily_amount not in (None, known_amount)):
+            coverage["disagreement_dates"].append(day.isoformat())
+        use_coarse = (
+            report is not None
+            and not complete
+            and not contradicts_known
+            and (
+                not hours
+                or use_daily_totals_for_incomplete
+                or (hourly_since is not None and day < hourly_since)
+            )
+        )
+        if hours and not complete:
+            coverage["incomplete_provider_dates"][day.isoformat()] = {
+                "known": len(hours),
+                "expected": PROVIDER_DAY_HOURS,
+            }
+        if use_coarse:
+            point = _record(
+                _provider_block_last_start(day, timezone),
+                _aware_datetime(report["observed_at"], "observed_at"),
+                report["state"],
+                report["delta"],
+                origin=report.get("origin", _MISSING),
+            )
+            _insert(projection, point)
+            coverage["daily_aggregate_dates"].append(day.isoformat())
+            coverage["suppressed_reported_hours"] += len(hours)
+        else:
+            projection.update(hours)
+            coverage["reported_hours"] += len(hours)
+    aggregate_dates = coverage["daily_aggregate_dates"]
+    coverage["daily_aggregate_days"] = len(aggregate_dates)
+    coverage["first_daily_aggregate_date"] = aggregate_dates[0] if aggregate_dates else None
+    coverage["last_daily_aggregate_date"] = aggregate_dates[-1] if aggregate_dates else None
+    coverage["incomplete_provider_days"] = len(coverage["incomplete_provider_dates"])
+    coverage["disagreement_days"] = len(coverage["disagreement_dates"])
+    for key in ("daily_aggregate_dates", "disagreement_dates"):
+        coverage[key] = coverage[key][-ENERGY_COVERAGE_RECENT_DATES:]
+    coverage["incomplete_provider_dates"] = dict(
+        list(coverage["incomplete_provider_dates"].items())[-ENERGY_COVERAGE_RECENT_DATES:]
+    )
+    return projection, coverage
 
 
 def _interval_starts(ledger):

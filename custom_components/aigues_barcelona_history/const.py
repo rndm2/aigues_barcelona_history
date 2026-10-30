@@ -12,6 +12,8 @@ CONF_SHOULD_IMPORT_HISTORY = "should_import_history"
 CONF_HISTORY_DAYS = "history_days"
 CONF_HOURLY_HISTORY_DAYS = "hourly_history_days"
 CONF_SCAN_INTERVAL_MINUTES = "scan_interval_minutes"
+CONF_ENERGY_DAILY_FALLBACK = "energy_daily_fallback"
+DEFAULT_ENERGY_DAILY_FALLBACK = True
 
 ATTR_LAST_MEASURE = "Last measure"
 IMPORT_PHASES = frozenset({"idle", "running", "retrying", "completed", "failed"})

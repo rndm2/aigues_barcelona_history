@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, call, patch
 import requests
 from test_aigues_barcelona_history import (
     DAILY_ID,
+    ENERGY_ID,
     OfflineTests,
     reading,
 )
@@ -213,7 +214,7 @@ class ConsumptionRetryTests(OfflineTests):
         self.assertEqual(self.coordinator._store.saved["HOURLY"], old_hourly)
         self.assertEqual(len(self.coordinator._store.saved["DAILY"]), 1)
         self.assertEqual(self.coordinator._data["imported_intervals"], {"daily": 1, "hourly": 1})
-        self.assertEqual(set(self.publications()), {DAILY_ID})
+        self.assertEqual(set(self.publications()), {DAILY_ID, ENERGY_ID})
         self.sleep.assert_not_awaited()
         hourly_calls = [
             c

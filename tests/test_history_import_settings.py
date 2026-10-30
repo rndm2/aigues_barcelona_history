@@ -14,6 +14,7 @@ import voluptuous as vol
 
 from custom_components.aigues_barcelona_history import config_flow, settings
 from custom_components.aigues_barcelona_history.const import (
+    CONF_ENERGY_DAILY_FALLBACK,
     CONF_HISTORY_DAYS,
     CONF_HOURLY_HISTORY_DAYS,
     CONF_SCAN_INTERVAL_MINUTES,
@@ -40,6 +41,7 @@ class SettingsValidationTests(unittest.TestCase):
                 CONF_HOURLY_HISTORY_DAYS: 31,
                 CONF_SCAN_PERIOD: 3601,
                 CONF_SHOULD_IMPORT_HISTORY: True,
+                CONF_ENERGY_DAILY_FALLBACK: True,
             },
         )
         self.assertEqual((entry.data, entry.options), before)
@@ -121,6 +123,7 @@ class SettingsValidationTests(unittest.TestCase):
                 CONF_HISTORY_DAYS,
                 CONF_SCAN_INTERVAL_MINUTES,
                 CONF_SHOULD_IMPORT_HISTORY,
+                CONF_ENERGY_DAILY_FALLBACK,
             },
         )
         self.assertEqual(fields[CONF_SCAN_INTERVAL_MINUTES][0].default(), 65)
@@ -179,6 +182,7 @@ class ImportSettingsFlowTests(unittest.IsolatedAsyncioTestCase):
                 CONF_HISTORY_DAYS: 730,
                 CONF_SCAN_PERIOD: 3900,
                 CONF_SHOULD_IMPORT_HISTORY: True,
+                CONF_ENERGY_DAILY_FALLBACK: True,
             },
         )
         validate.assert_awaited_once()

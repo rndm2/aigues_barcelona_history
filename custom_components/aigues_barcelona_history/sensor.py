@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from functools import partial
 import hashlib
 import json
@@ -56,6 +56,7 @@ from .const import (
     CONF_2CAPTCHA_APIKEY,
     CONF_AUTH_SESSION_LIMIT,
     CONF_CONTRACT,
+    CONF_ENERGY_DAILY_FALLBACK,
     CONF_HISTORY_DAYS,
     CONF_HOURLY_HISTORY_DAYS,
     CONF_RETRY_NOT_BEFORE,
@@ -76,10 +77,13 @@ from .identity import (
 from .settings import effective_settings, validate_history_days
 from .statistics import (
     HOURLY_INTERVAL,
+    PROVIDER_TIME_ZONE,
     Frequency,
+    build_energy_projection,
     build_statistics,
     describe_hourly_coverage,
     describe_interval_coverage,
+    initial_energy_hourly_since,
     migrate_legacy_hourly_ledger,
     normalize_readings,
     plan_windows,
@@ -91,9 +95,9 @@ _LOGGER = logging.getLogger(__name__)
 MAX_FETCH_ATTEMPTS = 5
 MAX_INLINE_RETRY_SECONDS = 60
 MIN_REQUEST_INTERVAL_SECONDS = 1
-# The API's query-date labels and supplied timestamps use fixed CET year round.
-PROVIDER_TIME_ZONE = timezone(timedelta(hours=1))
 HOURLY_INTERVAL_VERSION = 2
+ENERGY_SERIES = "ENERGY"
+ENERGY_PROJECTION_VERSION = 1
 
 
 def _empty_import_status():
@@ -143,6 +147,9 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             Frequency.DAILY: f"{DOMAIN}:{self.id}_consumption",
             Frequency.HOURLY: f"{DOMAIN}:{self.id}_hourly_consumption",
         }
+        self.energy_statistic_id = f"{DOMAIN}:{self.id}_energy_consumption"
+        self._energy_hourly_since = None
+        self._energy_projection_initialized = False
         self.entry_id = entry.entry_id
         self._should_import_history = settings[CONF_SHOULD_IMPORT_HISTORY]
         self._lock = asyncio.Lock()
@@ -396,6 +403,24 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 saved = {frequency.value: {} for frequency in Frequency}
             if not isinstance(saved, dict):
                 raise ValueError("Saved History intervals must be a mapping")
+            energy_version = saved.get("energy_projection_version")
+            if energy_version is None and self.energy_statistic_id in await self._stored_metadata():
+                raise ValueError(
+                    "Saved Energy projection boundary is missing; restore its source backup"
+                )
+            if energy_version is not None:
+                if type(energy_version) is not int or energy_version != ENERGY_PROJECTION_VERSION:
+                    raise ValueError("Unsupported saved Energy projection format")
+                if "energy_hourly_since" not in saved:
+                    raise ValueError("Saved Energy detail boundary is missing")
+                since = saved.get("energy_hourly_since")
+                if since is not None:
+                    if not isinstance(since, str):
+                        raise ValueError("Saved Energy detail boundary must be a calendar date")
+                    self._energy_hourly_since = date.fromisoformat(since)
+                    if self._energy_hourly_since.isoformat() != since:
+                        raise ValueError("Saved Energy detail boundary must be a canonical date")
+                self._energy_projection_initialized = True
             version = saved.get("hourly_interval_version", 1)
             pending = saved.get("hourly_replay_pending", False)
             if (
@@ -423,16 +448,31 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             else:
                 candidate, _ = self._prepare_statistics(candidate)
                 self._hourly_replay_pending = pending
+                if any(candidate.values()) and (
+                    not self._energy_projection_initialized
+                    or (self._energy_hourly_since is None and candidate[Frequency.HOURLY.value])
+                ):
+                    await self._check_replay_coverage(candidate)
+                    await self._save_ledger(candidate)
             self._ledger = candidate
 
     async def _save_ledger(self, ledger, *, replay_pending=None) -> None:
         """Persist source intervals and replay state together before recorder writes."""
         if replay_pending is None:
             replay_pending = getattr(self, "_hourly_replay_pending", False)
+        since = self._energy_hourly_since
+        if not self._energy_projection_initialized or (
+            self._energy_hourly_since is None and ledger[Frequency.HOURLY.value]
+        ):
+            since = initial_energy_hourly_since(
+                ledger[Frequency.HOURLY.value], dt_util.DEFAULT_TIME_ZONE
+            )
         saved = {
             **ledger,
             "hourly_interval_version": HOURLY_INTERVAL_VERSION,
             "hourly_replay_pending": replay_pending,
+            "energy_projection_version": ENERGY_PROJECTION_VERSION,
+            "energy_hourly_since": (since.isoformat() if since else None),
         }
         if replay_pending:
             saved["hourly_replay_source_sha256"] = self._hourly_source_sha256(
@@ -440,6 +480,8 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             )
         await self._store.async_save(saved)
         self._hourly_replay_pending = replay_pending
+        self._energy_hourly_since = since
+        self._energy_projection_initialized = True
 
     @staticmethod
     def _hourly_source_sha256(hourly_ledger) -> str:
@@ -679,7 +721,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 self._set_import_status(phase="completed", last_error=None)
 
     async def _statistics_snapshot(self, frequency, points):
-        statistic_id = self.statistic_ids[frequency]
+        statistic_id = self._statistic_id(frequency)
         rows = await get_instance(self.hass).async_add_executor_job(
             get_last_statistics,
             self.hass,
@@ -702,30 +744,50 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
 
     def _statistic_metadata(self, frequency):
         """Keep source ownership and human-readable series roles in one place."""
-        role = (
-            "Provider daily totals (reference)"
-            if frequency is Frequency.DAILY
-            else "Water consumption (reported hours)"
-        )
+        roles = {
+            Frequency.DAILY: "Provider daily totals (reference)",
+            Frequency.HOURLY: "Water consumption (reported hours)",
+            ENERGY_SERIES: "Water consumption (all history)",
+        }
         return {
             "mean_type": 0,
             "unit_class": VolumeConverter.UNIT_CLASS,
             "has_sum": True,
-            "name": f"{NAME} {self.id}: {role}",
+            "name": f"{NAME} {self.id}: {roles[frequency]}",
             "source": DOMAIN,
-            "statistic_id": self.statistic_ids[frequency],
+            "statistic_id": self._statistic_id(frequency),
             "unit_of_measurement": UnitOfVolume.CUBIC_METERS,
         }
 
     async def _stored_metadata(self):
         return await get_instance(self.hass).async_add_executor_job(
-            partial(get_metadata, self.hass, statistic_ids=set(self.statistic_ids.values()))
+            partial(
+                get_metadata,
+                self.hass,
+                statistic_ids={*self.statistic_ids.values(), self.energy_statistic_id},
+            )
+        )
+
+    def _statistic_id(self, series):
+        return self.energy_statistic_id if series == ENERGY_SERIES else self.statistic_ids[series]
+
+    def _energy_projection(self):
+        return build_energy_projection(
+            self._ledger[Frequency.DAILY.value],
+            self._ledger[Frequency.HOURLY.value],
+            dt_util.DEFAULT_TIME_ZONE,
+            hourly_since=self._energy_hourly_since,
+            use_daily_totals_for_incomplete=effective_settings(self._entry())[
+                CONF_ENERGY_DAILY_FALLBACK
+            ],
         )
 
     async def _publish(self) -> None:
         """Trust recorder readback, not successful queueing or an in-memory cache."""
         self._assert_active()
         _, statistics = self._prepare_statistics(self._ledger)
+        energy, coverage = self._energy_projection()
+        statistics[ENERGY_SERIES] = build_statistics(energy)
         replay_pending = getattr(self, "_hourly_replay_pending", False)
         if replay_pending:
             if not self._ledger[Frequency.HOURLY.value]:
@@ -737,7 +799,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             await recorder.async_block_till_done()
             self._assert_active()
         stored_metadata = await self._stored_metadata()
-        metadata = {frequency: self._statistic_metadata(frequency) for frequency in Frequency}
+        metadata = {series: self._statistic_metadata(series) for series in statistics}
         expected = {
             frequency: {
                 point["start"].timestamp(): (point["state"], point["sum"]) for point in points
@@ -745,11 +807,33 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             for frequency, points in statistics.items()
         }
         changed = []
-        # Check coverage for both series before enqueueing either one.
+        # Validate both authoritative source series before any derived replacement.
+        snapshots = {}
+        for frequency in Frequency:
+            snapshots[frequency] = await self._statistics_snapshot(frequency, statistics[frequency])
+            self._assert_recorded_coverage(snapshots[frequency], expected[frequency].keys())
+        snapshots[ENERGY_SERIES] = await self._statistics_snapshot(
+            ENERGY_SERIES, statistics[ENERGY_SERIES]
+        )
+        if snapshots[ENERGY_SERIES] and not any(self._ledger.values()):
+            raise ValueError("Energy source history is missing; restore its source backup")
+        if not snapshots[ENERGY_SERIES].keys() <= expected[ENERGY_SERIES].keys():
+            # This view can be rebuilt from verified durable raw histories after
+            # a precision/policy change removes old aggregate or partial keys.
+            self._assert_active()
+            recorder = get_instance(self.hass)
+            recorder.async_clear_statistics([self.energy_statistic_id])
+            await recorder.async_block_till_done()
+            self._assert_active()
+            snapshots[ENERGY_SERIES] = await self._statistics_snapshot(
+                ENERGY_SERIES, statistics[ENERGY_SERIES]
+            )
+            if snapshots[ENERGY_SERIES]:
+                raise UpdateFailed("Recorder did not clear the derived Energy series")
+            stored_metadata = await self._stored_metadata()
         for frequency, points in statistics.items():
-            actual = await self._statistics_snapshot(frequency, points)
-            self._assert_recorded_coverage(actual, expected[frequency].keys())
-            stored = stored_metadata.get(self.statistic_ids[frequency])
+            actual = snapshots[frequency]
+            stored = stored_metadata.get(self._statistic_id(frequency))
             name_changed = stored is None or stored[1]["name"] != metadata[frequency]["name"]
             if not self._snapshot_matches(actual, expected[frequency]) or (points and name_changed):
                 changed.append(frequency)
@@ -763,11 +847,12 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 actual = await self._statistics_snapshot(frequency, statistics[frequency])
                 if not self._snapshot_matches(actual, expected[frequency]):
                     raise UpdateFailed("Recorder did not persist the complete History batch")
-                stored = stored_metadata.get(self.statistic_ids[frequency])
+                stored = stored_metadata.get(self._statistic_id(frequency))
                 if stored is None or stored[1]["name"] != metadata[frequency]["name"]:
                     raise UpdateFailed("Recorder did not persist the History series name")
         if replay_pending:
             await self._save_ledger(self._ledger, replay_pending=False)
+        self._data["energy_coverage"] = coverage
 
     def _update_display(self) -> None:
         readings = [row for ledger in self._ledger.values() for row in ledger.values()]
@@ -776,6 +861,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
             self._data[CONF_VALUE] = latest["state"]
             self._data[CONF_STATE] = latest["observed_at"]
         self._data["statistics"] = {
+            "energy": self.energy_statistic_id,
             "daily": self.statistic_ids[Frequency.HOURLY],
             "hourly": self.statistic_ids[Frequency.HOURLY],
             "provider_daily": self.statistic_ids[Frequency.DAILY],
@@ -875,5 +961,6 @@ class AiguesHistoryMeter(CoordinatorEntity, SensorEntity):
             "imported_intervals": self.coordinator._data.get("imported_intervals", {}),
             "hourly_coverage": self.coordinator._data.get("hourly_coverage", {}),
             "provider_daily_coverage": self.coordinator._data.get("provider_daily_coverage", {}),
+            "energy_coverage": self.coordinator._data.get("energy_coverage", {}),
             "import_status": self.coordinator._data.get("import_status", _empty_import_status()),
         }

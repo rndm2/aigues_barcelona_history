@@ -24,6 +24,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 from test_aigues_barcelona_history import (
     DAILY_ID,
+    ENERGY_ID,
     HOURLY_ID,
     MADRID,
     FakeStore,
@@ -187,13 +188,14 @@ class CoordinatorIntegrityTests(OfflineTests):
                 date(2026, 10, 27), date(2026, 10, 28), (Frequency.DAILY,)
             )
         self.assertEqual(len(self.coordinator._store.saved["DAILY"]), 1)
-        self.queue.async_import_statistics.assert_called_once()
+        self.assertEqual(set(self.publications()), {DAILY_ID, ENERGY_ID})
+        self.assertEqual(self.publication_count(DAILY_ID), 1)
 
         self.queue.async_import_statistics.side_effect = record_effect
         await self.coordinator._import_range(
             date(2026, 10, 27), date(2026, 10, 28), (Frequency.DAILY,)
         )
-        self.assertEqual(self.queue.async_import_statistics.call_count, 2)
+        self.assertEqual(self.publication_count(DAILY_ID), 2)
         self.assertTrue(self.recorded.get(DAILY_ID))
 
     async def test_recorder_readback_checks_middle_rows_not_only_latest_sum(self):
@@ -218,7 +220,8 @@ class CoordinatorIntegrityTests(OfflineTests):
         await self.coordinator._import_range(
             date(2026, 10, 27), date(2026, 10, 28), (Frequency.HOURLY,)
         )
-        self.assertEqual(self.queue.async_import_statistics.call_count, 2)
+        self.assertEqual(set(self.publications()), {HOURLY_ID, ENERGY_ID})
+        self.assertEqual(self.publication_count(HOURLY_ID), 2)
         self.assertEqual(len(self.recorded[HOURLY_ID]), 3)
 
     async def test_sum_overflow_does_not_poison_store_and_next_batch_can_recover(self):
@@ -261,6 +264,8 @@ class RecorderSQLiteIntegrityTests(OfflineTests):
         super().setUp()
         self.engine = create_engine("sqlite:///:memory:")
         self.addCleanup(self.engine.dispose)
+        with self.engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
         StatisticsMeta.__table__.create(self.engine)
         Statistics.__table__.create(self.engine)
         self.sessions = sessionmaker(bind=self.engine)
@@ -279,6 +284,9 @@ class RecorderSQLiteIntegrityTests(OfflineTests):
         self.metadata.side_effect = ha_statistics.get_metadata
         self.queue.async_import_statistics.side_effect = lambda metadata, points, table: (
             ha_statistics.import_statistics(self.queue, metadata, points, table)
+        )
+        self.queue.async_clear_statistics.side_effect = lambda ids: ha_statistics.clear_statistics(
+            self.queue, ids
         )
 
         # A native statistic sharing the meter's history must remain independent.

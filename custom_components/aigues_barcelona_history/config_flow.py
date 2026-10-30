@@ -132,7 +132,7 @@ async def validate_credentials(hass: HomeAssistant, data: dict[str, Any]) -> dic
 
 
 class AiguesBarcelonaHistoryOptionsFlow(config_entries.OptionsFlowWithReload):
-    """Apply changed UI options without reacting to token persistence."""
+    """Apply import and Energy display options without reacting to token persistence."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         values = {**self.config_entry.options, **effective_settings(self.config_entry)}
@@ -213,7 +213,7 @@ class AiguesBarcelonaHistoryConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
         )
 
     async def async_step_import_settings(self, user_input=None) -> FlowResult:
-        """Choose import depths after authentication, without signing in again."""
+        """Choose imports and Energy coverage after authentication, without another login."""
         if self._validated_input is None:
             return await self.async_step_user()
         values = new_entry_settings()

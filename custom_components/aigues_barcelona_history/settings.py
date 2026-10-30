@@ -13,17 +13,33 @@ from homeassistant.helpers.selector import (
 import voluptuous as vol
 
 from .const import (
+    CONF_ENERGY_DAILY_FALLBACK,
     CONF_HISTORY_DAYS,
     CONF_HOURLY_HISTORY_DAYS,
     CONF_SCAN_INTERVAL_MINUTES,
     CONF_SCAN_PERIOD,
     CONF_SHOULD_IMPORT_HISTORY,
+    DEFAULT_ENERGY_DAILY_FALLBACK,
     DEFAULT_HISTORY_DAYS,
     DEFAULT_SCAN_PERIOD,
     MAX_HISTORY_DAYS,
     MAX_SCAN_PERIOD,
     MIN_SCAN_PERIOD,
 )
+
+
+def _boolean(value) -> bool:
+    """Reject truthy strings and numbers in saved settings and submitted forms."""
+    if not isinstance(value, bool):
+        raise vol.Invalid("Choose true or false for each toggle")
+    return value
+
+
+class _StrictBooleanSelector(BooleanSelector):
+    """Keep the native toggle UI without the selector's truthiness coercion."""
+
+    def __call__(self, value) -> bool:
+        return _boolean(value)
 
 
 def _whole_number(value, field: str, minimum: int, maximum: int) -> int:
@@ -56,16 +72,16 @@ def effective_settings(entry) -> dict:
     """Resolve legacy entries without changing their saved data or pending run."""
     values = {**entry.data, **entry.options}
     daily_days = validate_history_days(values.get(CONF_HISTORY_DAYS, MAX_HISTORY_DAYS))
-    pending = values.get(CONF_SHOULD_IMPORT_HISTORY, False)
-    if not isinstance(pending, bool):
-        raise vol.Invalid("Import after saving must be a boolean")
     return {
         CONF_HISTORY_DAYS: daily_days,
         CONF_HOURLY_HISTORY_DAYS: validate_history_days(
             values.get(CONF_HOURLY_HISTORY_DAYS, daily_days)
         ),
         CONF_SCAN_PERIOD: _validate_scan_period(values.get(CONF_SCAN_PERIOD, DEFAULT_SCAN_PERIOD)),
-        CONF_SHOULD_IMPORT_HISTORY: pending,
+        CONF_SHOULD_IMPORT_HISTORY: _boolean(values.get(CONF_SHOULD_IMPORT_HISTORY, False)),
+        CONF_ENERGY_DAILY_FALLBACK: _boolean(
+            values.get(CONF_ENERGY_DAILY_FALLBACK, DEFAULT_ENERGY_DAILY_FALLBACK)
+        ),
     }
 
 
@@ -76,6 +92,7 @@ def new_entry_settings() -> dict:
         CONF_HOURLY_HISTORY_DAYS: DEFAULT_HISTORY_DAYS,
         CONF_SCAN_PERIOD: DEFAULT_SCAN_PERIOD,
         CONF_SHOULD_IMPORT_HISTORY: True,
+        CONF_ENERGY_DAILY_FALLBACK: DEFAULT_ENERGY_DAILY_FALLBACK,
     }
 
 
@@ -110,7 +127,11 @@ def settings_schema(values: Mapping) -> vol.Schema:
             ),
             vol.Required(
                 CONF_SHOULD_IMPORT_HISTORY, default=values[CONF_SHOULD_IMPORT_HISTORY]
-            ): BooleanSelector(),
+            ): _StrictBooleanSelector(),
+            vol.Required(
+                CONF_ENERGY_DAILY_FALLBACK,
+                default=values.get(CONF_ENERGY_DAILY_FALLBACK, DEFAULT_ENERGY_DAILY_FALLBACK),
+            ): _StrictBooleanSelector(),
         }
     )
 
@@ -127,6 +148,7 @@ def options_from_input(user_input: Mapping, existing_options: Mapping | None = N
         CONF_SCAN_INTERVAL_MINUTES,
         CONF_SCAN_PERIOD,
         CONF_SHOULD_IMPORT_HISTORY,
+        CONF_ENERGY_DAILY_FALLBACK,
     }
     if user_input.keys() - allowed:
         raise vol.Invalid("Unknown History setting")
@@ -138,8 +160,8 @@ def options_from_input(user_input: Mapping, existing_options: Mapping | None = N
     }
     values[CONF_HISTORY_DAYS] = validate_history_days(values[CONF_HISTORY_DAYS])
     values[CONF_HOURLY_HISTORY_DAYS] = validate_history_days(values[CONF_HOURLY_HISTORY_DAYS])
-    if not isinstance(values[CONF_SHOULD_IMPORT_HISTORY], bool):
-        raise vol.Invalid("Import after saving must be a boolean")
+    for key in (CONF_SHOULD_IMPORT_HISTORY, CONF_ENERGY_DAILY_FALLBACK):
+        values[key] = _boolean(values[key])
     if CONF_SCAN_INTERVAL_MINUTES in user_input:
         minutes = user_input[CONF_SCAN_INTERVAL_MINUTES]
         if isinstance(minutes, bool) or not isinstance(minutes, (int, float, Decimal)):

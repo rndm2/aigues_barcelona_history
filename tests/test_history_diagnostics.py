@@ -87,6 +87,7 @@ class HistoryDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                     "hourly_history_days": 7,
                     "scan_period": 3900,
                     "should_import_history": False,
+                    "energy_daily_fallback": True,
                 },
                 "authentication": {"session_limit_blocked": False, "retry_pending": False},
                 "meters": [

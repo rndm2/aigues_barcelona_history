@@ -12,8 +12,8 @@ against 2026.10.4. This unofficial integration uses the private customer-portal 
 
 ## Features
 
-- Hourly external statistics that HA groups into days, months and years in Energy.
-- Separate provider daily reports retained as a reference.
+- One Energy statistic combining older daily aggregates with available actual hours.
+- Separate reported-hour and provider daily-reference statistics for inspection.
 - Scoped corrections and backfills without duplicate consumption.
 - Previously saved hours retained when responses are partial or empty.
 - Separate import ranges, refresh minutes and two import buttons per contract.
@@ -79,6 +79,7 @@ through the integration's **Configure** action.
 | Hourly history to request | Past HA calendar days for hourly consumption, plus today. |
 | Daily reference history to request | Past provider dates for daily reports, plus today when available. |
 | Refresh interval | Recent-data refresh interval, in minutes. |
+| Use daily totals when hours are incomplete | Show one daily aggregate in Energy until complete hours arrive. Disable it to retain partial recent hours instead. Older daily history remains available. |
 | Import both histories after setup/saving (once) | Run both configured ranges once. |
 
 Each range accepts **1–1,825 past days**. New setups offer **365 days** each and
@@ -112,24 +113,45 @@ For example contract `EXAMPLE123`:
 | Resource | Identifier |
 | --- | --- |
 | Display sensor | `sensor.aigues_barcelona_history_example123` |
+| Combined Energy history | `aigues_barcelona_history:example123_energy_consumption` |
 | Canonical consumption | `aigues_barcelona_history:example123_hourly_consumption` |
 | Provider daily reference | `aigues_barcelona_history:example123_consumption` |
 
-Select **Water consumption (reported hours)** as the Energy water source. HA's
-daily and hourly views then use the same intervals. The separate daily reference
-can cover different day boundaries. Adding it, or another integration for the
-same meter, as a second Energy source counts that meter again in the total.
+Select **Water consumption (all history)** as the single Energy water source for
+the meter. It retains older daily history and uses actual hours for complete
+provider reporting blocks. Do not also select the source-only statistics or
+another integration for the same meter, because Energy would add them again.
+
+Older daily reports occupy one aggregate point per provider day. Native Energy
+compresses them into monthly and yearly views. HA statistics have no per-point
+duration field: opening an old date in hourly mode shows its entire daily total
+as one aggregate bar, not measured consumption during that hour. History never
+distributes it across 24 invented hours.
+
+By default, an incomplete provider block can also use its daily total while
+waiting for complete actual hours. Disable **Use daily totals when hours are
+incomplete** to keep partial recent hours and their incomplete totals. The detail
+boundary is saved once, so an isolated older backfill cannot erase daily history
+between it and the recent data. Complete older blocks can independently upgrade
+to actual hours. Available daily reports still cover dates with no hours.
+
+A complete hourly block replaces its aggregate without adding both amounts.
+Later cumulative sums are rebuilt. If a daily report is below consumption already
+reported by its known hours, the actual hours take priority and coverage exposes
+the disagreement. Provider fixed-CET blocks, rather than naive local dates,
+define ownership so winter boundary hours are not counted twice or lost.
 
 The display sensor shows the latest provider-reported meter reading. External
 consumption statistics are published separately. Its `hourly_coverage` attribute
 reports incomplete dates within the known span; it does not certify dates after
-the latest returned hour.
+the latest returned hour. Its compact `energy_coverage` attribute describes
+coarse days, actual hours and the active incomplete-day policy.
 
 ### View older reference history
 
-Energy only contains the reported hours selected as its source. Importing the
-separate daily reference does not create hourly history or extend Energy into
-years where hours are unavailable.
+The combined Energy statistic extends into older available daily history without
+creating an hourly source history for those dates. The two source statistics stay
+available for comparison. Requested dates with neither source remain absent.
 
 Use the native **Statistics graph** card with the provider daily-reference ID,
 `period: month` and `stat_types: [change]` to view monthly sums of available daily
@@ -173,8 +195,9 @@ from historical queries. Missing hours are never filled from meter differences.
 The provider's selected query date is not always an HA calendar day. Its observed
 fixed-CET date convention can end a winter daily report around 23:00 Madrid. Thus
 the separate **Provider daily totals (reference)** can differ from a civil HA day
-even with complete hours. The canonical hourly series supplies both HA's daily
-and hourly consumption views. These use the same actual intervals.
+even with complete hours. The combined series selects each provider block once.
+Its daily/monthly views reduce the same selected points as its hourly view, while
+older coarse points retain the provider's reporting-date meaning.
 An Aigües point labeled 01:02 is a closing meter reading. Its consumption appears
 in HA's preceding 00:00 interval, so the printed hour labels differ by design.
 
@@ -182,6 +205,12 @@ Version 0.4.4 repairs previously saved reading-time buckets once. It retains all
 original readings and amounts, saves a replay marker, replaces only History's
 hourly statistic through recorder, and verifies the replacement before marking
 the repair complete. An interrupted replay is retried from the durable source.
+
+An explicitly imported recorder archive can extend daily history with verified
+consecutive meter increments. Its first cumulative reading is only a baseline,
+never consumption. Archive records retain their source statistic, timestamp and
+row digest. Original recorder statistics are read-only during such an import,
+and actual later API observations can replace those dated archive records.
 
 New hours are inserted and returned hourly corrections replace saved values,
 even if their observation minute moved backwards. Only returned source intervals
