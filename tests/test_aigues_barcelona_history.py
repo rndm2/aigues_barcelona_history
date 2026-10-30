@@ -45,6 +45,7 @@ CONTRACT = "TEST123"
 OBJECT_ID = CONTRACT.lower()
 DAILY_ID = f"{DOMAIN}:{OBJECT_ID}_consumption"
 HOURLY_ID = f"{DOMAIN}:{OBJECT_ID}_hourly_consumption"
+ENERGY_ID = f"{DOMAIN}:{OBJECT_ID}_energy_consumption"
 MADRID = ZoneInfo("Europe/Madrid")
 NOW = datetime(2026, 10, 29, 17, 45, tzinfo=MADRID)
 
@@ -97,6 +98,9 @@ def make_coordinator(store=None):
     coordinator.sensor_entity_id = f"sensor.{DOMAIN}_{OBJECT_ID}"
     coordinator.sensor_unique_id = f"{DOMAIN}_{OBJECT_ID}_meter"
     coordinator.statistic_ids = {Frequency.DAILY: DAILY_ID, Frequency.HOURLY: HOURLY_ID}
+    coordinator.energy_statistic_id = ENERGY_ID
+    coordinator._energy_hourly_since = None
+    coordinator._energy_projection_initialized = False
     coordinator.entry_id = entry.entry_id
     coordinator._data = {"import_status": sensor._empty_import_status()}
     coordinator._ledger = None
@@ -138,6 +142,7 @@ class OfflineTests(unittest.IsolatedAsyncioTestCase):
         self.recorded_metadata = {}
         self.queue = SimpleNamespace(
             async_import_statistics=Mock(side_effect=self.record_points),
+            async_clear_statistics=Mock(side_effect=self.clear_statistics),
             async_block_till_done=AsyncMock(),
             async_add_executor_job=execute,
         )
@@ -154,6 +159,11 @@ class OfflineTests(unittest.IsolatedAsyncioTestCase):
             patch.object(sensor, "get_metadata", side_effect=self.read_metadata)
         )
         self.coordinator = make_coordinator()
+
+    def clear_statistics(self, statistic_ids):
+        for statistic_id in statistic_ids:
+            self.recorded.pop(statistic_id, None)
+            self.recorded_metadata.pop(statistic_id, None)
 
     def record_points(self, metadata, points, table):
         self.recorded_metadata[metadata["statistic_id"]] = (123, deepcopy(metadata))
@@ -189,6 +199,12 @@ class OfflineTests(unittest.IsolatedAsyncioTestCase):
             for c in self.queue.async_import_statistics.call_args_list
         }
 
+    def publication_count(self, statistic_id):
+        return sum(
+            call.args[0]["statistic_id"] == statistic_id
+            for call in self.queue.async_import_statistics.call_args_list
+        )
+
 
 class CoordinatorLedgerTests(OfflineTests):
     async def test_loads_store_once_and_persists_source_deltas(self):
@@ -200,10 +216,19 @@ class CoordinatorLedgerTests(OfflineTests):
         store.async_save.assert_awaited_once()
         self.assertEqual(
             set(store.saved),
-            {"DAILY", "HOURLY", "hourly_interval_version", "hourly_replay_pending"},
+            {
+                "DAILY",
+                "HOURLY",
+                "hourly_interval_version",
+                "hourly_replay_pending",
+                "energy_projection_version",
+                "energy_hourly_since",
+            },
         )
         self.assertEqual(store.saved["hourly_interval_version"], 2)
         self.assertFalse(store.saved["hourly_replay_pending"])
+        self.assertEqual(store.saved["energy_projection_version"], 1)
+        self.assertIsNone(store.saved["energy_hourly_since"])
         self.assertEqual(len(store.saved["DAILY"]), 1)
         row = next(iter(store.saved["DAILY"].values()))
         self.assertEqual((row["delta"], row["state"]), (1.478, 655.724))
@@ -280,7 +305,7 @@ class CoordinatorLedgerTests(OfflineTests):
             date(2026, 10, 27), date(2026, 10, 29), tuple(Frequency)
         )
         published = self.publications()
-        self.assertEqual(set(published), {DAILY_ID, HOURLY_ID})
+        self.assertEqual(set(published), {DAILY_ID, HOURLY_ID, ENERGY_ID})
         self.assertEqual([p["sum"] for p in published[DAILY_ID][1]], [1.478])
         self.assertEqual([p["sum"] for p in published[HOURLY_ID][1]], [0.062])
         self.assertEqual(self.coordinator._data["imported_intervals"], {"daily": 1, "hourly": 1})
@@ -412,7 +437,7 @@ class RefreshAndManualImportTests(OfflineTests):
         )
         result = await self.coordinator._async_update_data()
         self.assertEqual(result[CONF_VALUE], 656.48)
-        self.assertEqual(set(self.publications()), {DAILY_ID})
+        self.assertEqual(set(self.publications()), {DAILY_ID, ENERGY_ID})
         self.assertEqual(result["imported_intervals"], {"daily": 1, "hourly": 0})
 
     async def test_hourly_refresh_queries_past_seven_days_and_today_separately(self):

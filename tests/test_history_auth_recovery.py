@@ -10,6 +10,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from test_aigues_barcelona_history import (
     DAILY_ID,
+    ENERGY_ID,
     HOURLY_ID,
     OfflineTests,
     make_coordinator,
@@ -144,7 +145,7 @@ class HourlyRecoveryTests(OfflineTests):
         await self.coordinator._async_update_data()
 
         self.assertEqual(self.coordinator._store.saved["HOURLY"], previous_hourly)
-        self.assertEqual(set(self.publications()), {DAILY_ID})
+        self.assertEqual(set(self.publications()), {DAILY_ID, ENERGY_ID})
         self.assertEqual(self.publications()[DAILY_ID][1][0]["sum"], 1.7)
         hourly_calls = [
             call

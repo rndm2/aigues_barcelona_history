@@ -10,6 +10,7 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 from test_aigues_barcelona_history import (
     CONTRACT,
     DAILY_ID,
+    ENERGY_ID,
     HOURLY_ID,
     OfflineTests,
     reading,
@@ -30,6 +31,7 @@ class CanonicalCalendarCoordinatorTests(OfflineTests):
             date(2026, 10, 27), date(2026, 10, 29), tuple(Frequency)
         )
         expected = {
+            "energy": ENERGY_ID,
             "daily": HOURLY_ID,
             "hourly": HOURLY_ID,
             "provider_daily": DAILY_ID,
@@ -57,7 +59,8 @@ class CanonicalCalendarCoordinatorTests(OfflineTests):
         )
         self.assertEqual(self.recorded[HOURLY_ID], previous_rows)
         self.assertEqual(self.coordinator._store.saved["HOURLY"], previous_source)
-        self.assertEqual(set(self.publications()), {DAILY_ID})
+        self.assertEqual(set(self.publications()), {DAILY_ID, ENERGY_ID})
+        self.queue.async_clear_statistics.assert_called_once_with([ENERGY_ID])
         self.assertEqual(self.coordinator._data["statistics"]["daily"], HOURLY_ID)
         self.assertEqual(self.coordinator._data["imported_intervals"], {"daily": 1, "hourly": 1})
 

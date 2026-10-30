@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0 — 2026-10-30
+
+- Add one Energy statistic combining older daily aggregates with complete reported hours.
+- Replace coarse blocks when complete hours arrive, without duplicate consumption.
+- Keep both original History source series available and preserve their raw observations.
+- Add a friendly option for full daily aggregates or partial recent hourly detail.
+- Persist the detail boundary and protect replay from missing source metadata.
+- Retain explicit provenance for validated archived daily increments, excluding unknown first baselines.
+
 ## 0.4.4 — 2026-10-30
 
 - Assign hourly consumption to the interval preceding its meter reading, retaining the API offset and both daylight-saving folds.
