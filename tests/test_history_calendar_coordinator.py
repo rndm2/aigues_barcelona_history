@@ -97,7 +97,7 @@ class CanonicalCalendarCoordinatorTests(OfflineTests):
         self.recorded_metadata[HOURLY_ID][1]["name"] = "Legacy hourly display name"
         self.queue.async_import_statistics.reset_mock()
         self.queue.async_import_statistics.side_effect = lambda *args: None
-        with self.assertRaisesRegex(UpdateFailed, "series name"):
+        with self.assertRaisesRegex(UpdateFailed, "series metadata"):
             await self.coordinator._publish()
         self.assertEqual(self.recorded, previous_rows)
         self.assertEqual(self.recorded_metadata[HOURLY_ID][1]["name"], "Legacy hourly display name")
@@ -149,18 +149,18 @@ class CanonicalCalendarCoordinatorTests(OfflineTests):
         )
         self.assertEqual(source["2026-10-27T08:00:00+00:00"]["delta"], 0.25)
         rows = [self.recorded[HOURLY_ID][key] for key in sorted(self.recorded[HOURLY_ID])]
-        self.assertEqual([row["sum"] for row in rows], [0.1, 0.35, 0.4, 0.7, 1.1])
+        self.assertEqual([row["sum"] for row in rows], [100, 350, 400, 700, 1100])
         previous = 0
         changes = []
         for row in rows:
             changes.append(row["sum"] - previous)
             previous = row["sum"]
-        for actual, expected in zip(changes, (0.1, 0.25, 0.05, 0.3, 0.4)):
+        for actual, expected in zip(changes, (100, 250, 50, 300, 400)):
             self.assertAlmostEqual(actual, expected)
         outside_after = datetime.fromisoformat("2026-10-28T10:00:00+00:00").timestamp()
-        self.assertEqual(rows_before[outside_after]["sum"], 1.0)
-        self.assertEqual(self.recorded[HOURLY_ID][outside_after]["sum"], 1.1)
-        self.assertEqual(self.recorded[HOURLY_ID][outside_after]["state"], 101.0)
+        self.assertEqual(rows_before[outside_after]["sum"], 1000)
+        self.assertEqual(self.recorded[HOURLY_ID][outside_after]["sum"], 1100)
+        self.assertEqual(self.recorded[HOURLY_ID][outside_after]["state"], 101000)
 
         self.queue.async_import_statistics.reset_mock()
         before_repeat = deepcopy(self.recorded)

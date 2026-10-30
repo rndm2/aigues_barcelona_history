@@ -432,6 +432,8 @@ class EnergyActualHAViewsTests(unittest.TestCase):
         from homeassistant.components.recorder.db_schema import Statistics
         from test_history_integrity import RecorderSQLiteIntegrityTests
 
+        from custom_components.aigues_barcelona_history.sensor import _published_statistics
+
         fixture = RecorderSQLiteIntegrityTests()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
@@ -445,9 +447,7 @@ class EnergyActualHAViewsTests(unittest.TestCase):
             **fixture.coordinator._statistic_metadata(statistics.Frequency.HOURLY),
             "statistic_id": target,
         }
-        ha.import_statistics(
-            fixture.queue, metadata, statistics.build_statistics(ledger), Statistics
-        )
+        ha.import_statistics(fixture.queue, metadata, _published_statistics(ledger), Statistics)
         start = datetime(2026, 1, 1, tzinfo=MADRID)
         stop = datetime(2026, 7, 1, tzinfo=MADRID) - timedelta(microseconds=1)
         expected = {"2026-01": 3100, "2026-06": 583}

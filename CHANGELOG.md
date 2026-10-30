@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.3 — 2026-10-30
+
+- Publish all three owned consumption statistics in litres for native HA graphs.
+- Convert values and metadata together from the validated source ledger, preserving reporting dates, gaps and consumption.
+- Keep provider responses and the durable source ledger in their original cubic metres.
+- Suggest litres and whole-litre precision for the meter display, retaining HA's native unit conversion.
+
 ## 0.5.2 — 2026-10-30
 
 - Add saved From/To date selectors and a manual hourly-range import button to each History device.

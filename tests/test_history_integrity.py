@@ -17,8 +17,10 @@ from homeassistant.components.recorder.db_schema import (
     StatisticsMeta,
 )
 from homeassistant.components.recorder.table_managers.statistics_meta import StatisticsMetaManager
+from homeassistant.const import UnitOfVolume
 from homeassistant.helpers import recorder as recorder_helper
 from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.util.unit_conversion import VolumeConverter
 from sqlalchemy import create_engine, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
@@ -242,7 +244,7 @@ class CoordinatorIntegrityTests(OfflineTests):
             date(2026, 10, 27), date(2026, 10, 29), (Frequency.DAILY,)
         )
         self.coordinator._store.async_save.assert_awaited_once()
-        self.assertEqual(self.publications()[DAILY_ID][1][0]["sum"], 0.1)
+        self.assertEqual(self.publications()[DAILY_ID][1][0]["sum"], 100)
 
     async def test_fetch_filters_padded_responses_to_requested_ha_dates(self):
         self.coordinator._api.consumptions.return_value = [
@@ -309,14 +311,31 @@ class RecorderSQLiteIntegrityTests(OfflineTests):
         self.old_snapshot = self.database_rows(self.old_id)
 
     def database_rows(self, statistic_id):
+        """Compare physical quantities in source m³, requiring published litres."""
         with self.sessions() as session:
+            unit = session.scalar(
+                select(StatisticsMeta.unit_of_measurement).where(
+                    StatisticsMeta.statistic_id == statistic_id
+                )
+            )
+            if statistic_id in (DAILY_ID, HOURLY_ID, ENERGY_ID) and unit is not None:
+                self.assertEqual(unit, UnitOfVolume.LITERS)
+            elif statistic_id == self.old_id:
+                self.assertEqual(unit, UnitOfVolume.CUBIC_METERS)
             rows = session.execute(
                 select(Statistics.start_ts, Statistics.state, Statistics.sum)
                 .join(StatisticsMeta, Statistics.metadata_id == StatisticsMeta.id)
                 .where(StatisticsMeta.statistic_id == statistic_id)
                 .order_by(Statistics.start_ts)
             )
-            return [tuple(row) for row in rows]
+            return [
+                (
+                    start,
+                    VolumeConverter.convert(state, unit, UnitOfVolume.CUBIC_METERS),
+                    VolumeConverter.convert(cumulative, unit, UnitOfVolume.CUBIC_METERS),
+                )
+                for start, state, cumulative in rows
+            ]
 
     def actual_ha_changes(self, statistic_id, start=None):
         result = ha_statistics.get_last_statistics(
@@ -343,6 +362,14 @@ class RecorderSQLiteIntegrityTests(OfflineTests):
                 metadata,
                 result,
             )
+            unit = metadata[statistic_id][1]["unit_of_measurement"]
+            self.assertEqual(unit, UnitOfVolume.LITERS)
+            for row in result[statistic_id]:
+                for field in ("state", "sum", "change"):
+                    if row.get(field) is not None:
+                        row[field] = VolumeConverter.convert(
+                            row[field], unit, UnitOfVolume.CUBIC_METERS
+                        )
         return result[statistic_id]
 
     async def test_real_sqlite_sparse_hourly_import_does_not_bridge_meter_jump(self):

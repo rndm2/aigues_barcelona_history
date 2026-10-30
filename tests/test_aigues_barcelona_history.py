@@ -245,11 +245,11 @@ class CoordinatorLedgerTests(OfflineTests):
             Frequency.DAILY, [reading("2026-10-27T23:01:28+01:00", 655.724, 1.478)]
         )
         metadata, points, table = self.publications()[DAILY_ID]
-        self.assertEqual((points[0]["sum"], points[0]["state"]), (1.478, 655.724))
+        self.assertEqual((points[0]["sum"], points[0]["state"]), (1478, 655724))
         self.assertIs(table, recorder_statistics.Statistics)
         self.assertEqual(metadata["source"], DOMAIN)
         self.assertEqual(metadata["unit_class"], VolumeConverter.UNIT_CLASS)
-        self.assertEqual(metadata["unit_of_measurement"], UnitOfVolume.CUBIC_METERS)
+        self.assertEqual(metadata["unit_of_measurement"], UnitOfVolume.LITERS)
 
     async def test_restart_replays_saved_ledger_without_baseline_drift(self):
         rows = [
@@ -265,7 +265,7 @@ class CoordinatorLedgerTests(OfflineTests):
             date(2026, 10, 27), date(2026, 10, 29), (Frequency.DAILY,)
         )
         self.assertEqual(self.publications()[DAILY_ID][1], first)
-        self.assertEqual(first[-1]["sum"], 2.234)
+        self.assertEqual(first[-1]["sum"], 2234)
         self.assertEqual(self.coordinator._data[CONF_VALUE], 656.48)
 
     async def test_saved_data_recovers_before_failing_network_request(self):
@@ -285,7 +285,7 @@ class CoordinatorLedgerTests(OfflineTests):
                 date(2026, 10, 27), date(2026, 10, 29), tuple(Frequency)
             )
         self.assertEqual(self.coordinator._data[CONF_VALUE], 656.48)
-        self.assertEqual(self.publications()[DAILY_ID][1][-1]["sum"], 0.756)
+        self.assertEqual(self.publications()[DAILY_ID][1][-1]["sum"], 756)
         self.coordinator._store.async_save.assert_not_awaited()
         self.assertEqual(self.coordinator._store.saved, saved)
 
@@ -312,8 +312,8 @@ class CoordinatorLedgerTests(OfflineTests):
         )
         published = self.publications()
         self.assertEqual(set(published), {DAILY_ID, HOURLY_ID, ENERGY_ID})
-        self.assertEqual([p["sum"] for p in published[DAILY_ID][1]], [1.478])
-        self.assertEqual([p["sum"] for p in published[HOURLY_ID][1]], [0.062])
+        self.assertEqual([p["sum"] for p in published[DAILY_ID][1]], [1478])
+        self.assertEqual([p["sum"] for p in published[HOURLY_ID][1]], [62])
         self.assertEqual(self.coordinator._data["imported_intervals"], {"daily": 1, "hourly": 1})
 
     async def test_overlapping_response_is_idempotent(self):
@@ -332,12 +332,12 @@ class CoordinatorLedgerTests(OfflineTests):
             reading("2026-10-27T11:01:28+01:00", 654.6, 0.2),
         ]
         await self.import_frequency(Frequency.HOURLY, rows)
-        self.assertEqual([p["sum"] for p in self.publications()[HOURLY_ID][1]], [0.1, 0.3])
+        self.assertEqual([p["sum"] for p in self.publications()[HOURLY_ID][1]], [100, 300])
         self.queue.async_import_statistics.reset_mock()
         await self.import_frequency(
             Frequency.HOURLY, [reading("2026-10-27T10:01:28+01:00", 654.30, 0.15)]
         )
-        self.assertEqual([p["sum"] for p in self.publications()[HOURLY_ID][1]], [0.15, 0.35])
+        self.assertEqual([p["sum"] for p in self.publications()[HOURLY_ID][1]], [150, 350])
         self.assertEqual(len(self.coordinator._store.saved["HOURLY"]), 2)
 
     async def test_invalid_partial_batch_persists_nothing(self):
@@ -393,7 +393,7 @@ class CoordinatorLedgerTests(OfflineTests):
         await self.coordinator._import_range(
             date(2026, 10, 27), date(2026, 10, 29), (Frequency.DAILY,)
         )
-        self.assertEqual(self.publications()[DAILY_ID][1][-1]["sum"], 1.478)
+        self.assertEqual(self.publications()[DAILY_ID][1][-1]["sum"], 1478)
         self.assertEqual(self.coordinator._data[CONF_VALUE], 655.724)
 
     async def test_concurrent_imports_serialize_without_lost_intervals(self):
@@ -431,7 +431,7 @@ class CoordinatorLedgerTests(OfflineTests):
         await asyncio.gather(first, second)
         self.assertEqual(maximum, 1)
         self.assertEqual(len(self.coordinator._store.saved["DAILY"]), 2)
-        self.assertEqual(self.publications()[DAILY_ID][1][-1]["sum"], 2.234)
+        self.assertEqual(self.publications()[DAILY_ID][1][-1]["sum"], 2234)
         self.coordinator._store.async_load.assert_awaited_once()
 
 
