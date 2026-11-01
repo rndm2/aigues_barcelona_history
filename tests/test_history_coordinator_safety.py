@@ -124,9 +124,23 @@ class CoordinatorSafetyTests(OfflineTests):
         for coordinator in (self.coordinator, second):
             self.real_auth(coordinator)
             coordinator._api.login.side_effect = AiguesApiSessionLimitError("Limit")
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def fail_after_waiter_arrives():
+            entered.set()
+            await release.wait()
+            raise AiguesApiSessionLimitError("Limit")
+
+        self.coordinator._api.login.side_effect = fail_after_waiter_arrives
         with patch.object(sensor.time, "time", return_value=1000):
-            outcomes = await asyncio.gather(
-                self.coordinator._ensure_token(), second._ensure_token(), return_exceptions=True
+            first_task = asyncio.create_task(self.coordinator._ensure_token())
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            second_task = asyncio.create_task(second._ensure_token())
+            await asyncio.sleep(0)
+            second._api.login.assert_not_called()
+            release.set()
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(first_task, second_task, return_exceptions=True), timeout=2
             )
         self.assertIsInstance(outcomes[0], AiguesApiSessionLimitError)
         self.assertIsInstance(outcomes[1], AiguesApiRateLimitError)
