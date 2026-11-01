@@ -51,12 +51,12 @@ class AiguesApiAuthError(AiguesApiError):
     """Authentication or authorization error."""
 
 
-class AiguesApiSessionLimitError(AiguesApiAuthError):
-    """A provider session limit requires intervention before another paid login."""
-
-
 class AiguesApiRateLimitError(AiguesApiError):
     """Rate-limit error."""
+
+
+class AiguesApiSessionLimitError(AiguesApiRateLimitError):
+    """A provider session limit requires a cooldown before another attempt."""
 
 
 class AiguesApiServerError(AiguesApiError):
@@ -318,7 +318,7 @@ class AiguesBarcelonaHistoryApiClient:
                 self._set_captcha_cooldown(30)
                 if isinstance(e, AiguesApiSessionLimitError):
                     _LOGGER.warning(
-                        "Provider session limit rejected login; new paid attempts are paused"
+                        "Provider session limit rejected login; automatic retry will follow cooldown"
                     )
                 else:
                     _LOGGER.error("Login POST failed, setting cooldown (%s)", type(e).__name__)

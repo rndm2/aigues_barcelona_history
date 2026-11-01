@@ -5,6 +5,7 @@ NAME = "Aigües Barcelona History"
 
 CONF_CONTRACT = "contract"
 CONF_AUTH_SESSION_LIMIT = "auth_session_limit"
+CONF_AUTH_SESSION_LIMIT_ATTEMPTS = "auth_session_limit_attempts"
 CONF_RETRY_NOT_BEFORE = "retry_not_before"
 CONF_VALUE = "value"
 CONF_2CAPTCHA_APIKEY = "twocaptcha_api_key"

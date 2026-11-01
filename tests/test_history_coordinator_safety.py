@@ -22,6 +22,7 @@ from custom_components.aigues_barcelona_history.api import (
 )
 from custom_components.aigues_barcelona_history.const import (
     CONF_AUTH_SESSION_LIMIT,
+    CONF_AUTH_SESSION_LIMIT_ATTEMPTS,
     CONF_RETRY_NOT_BEFORE,
 )
 from custom_components.aigues_barcelona_history.statistics import Frequency
@@ -41,37 +42,115 @@ class CoordinatorSafetyTests(OfflineTests):
         )
         coordinator._api.is_token_expired.return_value = True
 
-    async def test_known_session_limit_blocks_later_paid_attempts_and_restart(self):
+    async def test_session_limit_survives_restart_then_retries_with_saved_credentials(self):
         self.real_auth(self.coordinator)
+        before = deepcopy(self.entry.data)
         self.coordinator._api.login.side_effect = AiguesApiSessionLimitError(
             "Session limit", error_code="MAX_SESSIONS_REACHED_ERROR"
         )
-        with self.assertRaises(ConfigEntryAuthFailed):
-            await self.coordinator._ensure_token()
+        with patch.object(sensor.time, "time", return_value=1000):
+            with self.assertRaises(AiguesApiSessionLimitError):
+                await self.coordinator._ensure_token()
         self.assertTrue(self.entry.data[CONF_AUTH_SESSION_LIMIT])
+        self.assertEqual(self.entry.data[CONF_AUTH_SESSION_LIMIT_ATTEMPTS], 1)
+        self.assertEqual(self.entry.data[CONF_RETRY_NOT_BEFORE], 2800)
         self.coordinator._api.login.assert_called_once()
         restarted = make_coordinator()
         restarted.hass = self.coordinator.hass
         self.real_auth(restarted)
-        with self.assertRaises(ConfigEntryAuthFailed):
-            await restarted._ensure_token()
+        with patch.object(sensor.time, "time", return_value=1500):
+            with self.assertRaises(AiguesApiRateLimitError):
+                await restarted._ensure_token()
         restarted._api.login.assert_not_called()
-        with self.assertRaises(ConfigEntryAuthFailed):
-            await self.coordinator._ensure_token()
+        self.assertEqual({key: self.entry.data[key] for key in before}, before)
+
+        def recover():
+            restarted._api.is_token_expired.return_value = False
+            return True
+
+        restarted._api.login.side_effect = recover
+        restarted._api.get_token.return_value = "renewed-token"
+        with patch.object(sensor.time, "time", return_value=2800):
+            await restarted._ensure_token()
+        restarted._api.login.assert_called_once()
+        self.assertFalse(self.entry.data[CONF_AUTH_SESSION_LIMIT])
+        self.assertEqual(self.entry.data[CONF_AUTH_SESSION_LIMIT_ATTEMPTS], 0)
+        self.assertEqual(self.entry.data["token"], "renewed-token")
+        self.assertEqual({key: self.entry.data[key] for key in before}, before)
         self.coordinator._api.login.assert_called_once()
 
-    async def test_session_limit_on_consumption_get_also_blocks_future_paid_login(self):
+    async def test_session_limit_on_consumption_get_pauses_future_paid_login(self):
         self.coordinator._api.consumptions.side_effect = AiguesApiSessionLimitError(
             "Session limit", error_code="MAX_SESSIONS_REACHED_ERROR"
         )
-        with self.assertRaises(ConfigEntryAuthFailed):
-            await self.coordinator._request_consumptions(START, END, Frequency.DAILY)
+        with patch.object(sensor.time, "time", return_value=1000):
+            with self.assertRaises(AiguesApiSessionLimitError):
+                await self.coordinator._request_consumptions(START, END, Frequency.DAILY)
         self.assertTrue(self.entry.data[CONF_AUTH_SESSION_LIMIT])
         self.coordinator._api.consumptions.assert_called_once()
         self.real_auth(self.coordinator)
-        with self.assertRaises(ConfigEntryAuthFailed):
-            await self.coordinator._ensure_token()
+        with patch.object(sensor.time, "time", return_value=1001):
+            with self.assertRaises(AiguesApiRateLimitError):
+                await self.coordinator._ensure_token()
         self.coordinator._api.login.assert_not_called()
+
+    async def test_legacy_permanent_flag_recovers_without_replacing_credentials_or_ledger(self):
+        await self.import_frequency(
+            Frequency.HOURLY, [reading("2026-10-27T10:01:24+01:00", 655.0, 0.023)]
+        )
+        saved = deepcopy(self.coordinator._store.saved)
+        ids = deepcopy(self.coordinator.statistic_ids)
+        credentials = deepcopy(self.entry.data)
+        self.entry.data[CONF_AUTH_SESSION_LIMIT] = True
+        self.real_auth(self.coordinator)
+
+        def recover():
+            self.coordinator._api.is_token_expired.return_value = False
+            return True
+
+        self.coordinator._api.login.side_effect = recover
+        self.coordinator._api.get_token.return_value = "renewed-token"
+        await self.coordinator._ensure_token()
+        self.coordinator._api.login.assert_called_once()
+        self.assertFalse(self.entry.data[CONF_AUTH_SESSION_LIMIT])
+        self.assertEqual(self.coordinator._store.saved, saved)
+        self.assertEqual(self.coordinator.statistic_ids, ids)
+        self.assertEqual({key: self.entry.data[key] for key in credentials}, credentials)
+
+    async def test_concurrent_contracts_cannot_buy_another_login_during_session_pause(self):
+        second = make_coordinator()
+        second.hass = self.coordinator.hass
+        second._token_lock = self.coordinator._token_lock
+        for coordinator in (self.coordinator, second):
+            self.real_auth(coordinator)
+            coordinator._api.login.side_effect = AiguesApiSessionLimitError("Limit")
+        with patch.object(sensor.time, "time", return_value=1000):
+            outcomes = await asyncio.gather(
+                self.coordinator._ensure_token(), second._ensure_token(), return_exceptions=True
+            )
+        self.assertIsInstance(outcomes[0], AiguesApiSessionLimitError)
+        self.assertIsInstance(outcomes[1], AiguesApiRateLimitError)
+        self.coordinator._api.login.assert_called_once()
+        second._api.login.assert_not_called()
+        self.assertEqual(self.entry.data[CONF_AUTH_SESSION_LIMIT_ATTEMPTS], 1)
+
+    async def test_late_success_preserves_newer_session_pause_and_attempt_count(self):
+        async def response(*args, **kwargs):
+            self.entry.data.update(
+                {
+                    CONF_AUTH_SESSION_LIMIT: True,
+                    CONF_AUTH_SESSION_LIMIT_ATTEMPTS: 3,
+                    CONF_RETRY_NOT_BEFORE: 8200,
+                }
+            )
+            return []
+
+        self.coordinator._api.consumptions.side_effect = response
+        with patch.object(sensor.time, "time", return_value=1000):
+            await self.coordinator._request_consumptions(START, END, Frequency.DAILY)
+        self.assertTrue(self.entry.data[CONF_AUTH_SESSION_LIMIT])
+        self.assertEqual(self.entry.data[CONF_AUTH_SESSION_LIMIT_ATTEMPTS], 3)
+        self.assertEqual(self.entry.data[CONF_RETRY_NOT_BEFORE], 8200)
 
     async def test_expired_token_only_entry_never_attempts_paid_login(self):
         self.real_auth(self.coordinator)

@@ -187,6 +187,7 @@ class ExistingSessionReuseTests(OfflineTests):
             (USER, token_for({"exp": 1600})),
         ]
         self.entry.data[CONF_AUTH_SESSION_LIMIT] = True
+        self.entry.data["password"] = ""
         for account, token in cases:
             with self.subTest(account=account, token_kind=token.split(".")[0]):
                 self.source.data.update({CONF_USERNAME: account, CONF_TOKEN: token})
@@ -209,6 +210,7 @@ class ExistingSessionReuseTests(OfflineTests):
 
     async def test_missing_any_configured_contract_cannot_adopt_or_clear_block(self):
         self.entry.data[CONF_AUTH_SESSION_LIMIT] = True
+        self.entry.data["password"] = ""
         self.rows = self.rows[:1]
         with self.assertRaises(ConfigEntryAuthFailed):
             await self.coordinator._ensure_token()
@@ -227,10 +229,11 @@ class ExistingSessionReuseTests(OfflineTests):
         self.sleep.assert_awaited_once_with(3)
         self.assert_no_paid_login()
 
-    async def test_expired_source_while_blocked_cannot_trigger_a_paid_login(self):
+    async def test_expired_source_during_cooldown_cannot_trigger_a_paid_login(self):
         self.entry.data[CONF_AUTH_SESSION_LIMIT] = True
+        self.entry.data[CONF_RETRY_NOT_BEFORE] = self.clock + 1800
         self.source.data[CONF_TOKEN] = self.expired
-        with self.assertRaises(ConfigEntryAuthFailed):
+        with self.assertRaises(provider.AiguesApiRateLimitError):
             await self.coordinator._ensure_token()
         self.assertFalse(self.validations)
         self.assert_no_paid_login()
@@ -252,9 +255,10 @@ class ExistingSessionReuseTests(OfflineTests):
 
     async def test_session_limit_during_validation_blocks_paid_fallback(self):
         self.outcomes.append(provider.AiguesApiSessionLimitError("Limit"))
-        with self.assertRaises(ConfigEntryAuthFailed):
+        with self.assertRaises(provider.AiguesApiSessionLimitError):
             await self.coordinator._ensure_token()
         self.assertTrue(self.entry.data[CONF_AUTH_SESSION_LIMIT])
+        self.assertEqual(self.entry.data[CONF_RETRY_NOT_BEFORE], self.clock + 1800)
         self.assert_no_paid_login()
 
     async def test_history_still_logs_in_normally_without_an_original_integration(self):
@@ -270,7 +274,7 @@ class ExistingSessionReuseTests(OfflineTests):
         self.assertEqual(self.entry.data[CONF_TOKEN], self.fresh)
         self.assertFalse(self.validations)
 
-    async def test_post_login_max_race_reuses_new_source_session_without_error_log(self):
+    async def test_post_login_max_race_reuses_new_session_only_after_cooldown(self):
         self.source.data[CONF_TOKEN] = self.expired
         self.coordinator._api.login = MethodType(REAL_LOGIN, self.coordinator._api)
         solver = Mock()
@@ -278,44 +282,52 @@ class ExistingSessionReuseTests(OfflineTests):
         self.enterContext(patch.object(provider, "TwoCaptcha", return_value=solver))
 
         def reject_login(**kwargs):
-            self.source.data[CONF_TOKEN] = self.fresh
+            self.source.data[CONF_TOKEN] = self.jwt(expiry=10000)
             return self.response(500, SESSION_LIMIT_RESPONSE)
 
         self.own_transport.request.side_effect = reject_login
-        with self.assertNoLogs("custom_components.aigues_barcelona_history", level="ERROR"):
+        with self.assertRaises(provider.AiguesApiSessionLimitError):
             await self.coordinator._ensure_token()
         solver.recaptcha.assert_called_once()
         self.own_transport.request.assert_called_once()
+        self.assertTrue(self.entry.data[CONF_AUTH_SESSION_LIMIT])
+        self.assertFalse(self.validations)
+        with self.assertRaises(provider.AiguesApiRateLimitError):
+            await self.coordinator._ensure_token()
+        self.clock = self.entry.data[CONF_RETRY_NOT_BEFORE]
+        await self.coordinator._ensure_token()
         self.assertFalse(self.entry.data[CONF_AUTH_SESSION_LIMIT])
-        self.assertEqual(self.entry.data[CONF_TOKEN], self.fresh)
+        self.assertEqual(self.entry.data[CONF_TOKEN], self.source.data[CONF_TOKEN])
         self.assertEqual(len(self.validations), 1)
+        solver.recaptcha.assert_called_once()
 
-    async def test_cancellation_during_post_max_recheck_preserves_the_paid_login_block(self):
+    async def test_cancellation_while_waiting_preserves_the_durable_session_cooldown(self):
         self.source.data[CONF_TOKEN] = self.expired
 
         def reject_login():
-            self.source.data[CONF_TOKEN] = self.fresh
             raise provider.AiguesApiSessionLimitError("Limit")
 
         self.coordinator._api.login.side_effect = reject_login
+        with self.assertRaises(provider.AiguesApiSessionLimitError):
+            await self.coordinator._ensure_token()
+        deadline = self.entry.data[CONF_RETRY_NOT_BEFORE]
+        self.clock = deadline - 10
         entered = asyncio.Event()
-        original_executor = self.coordinator.hass.async_add_executor_job
 
-        async def pending_validation(function, *args):
-            if getattr(function, "__name__", "") == "contracts":
-                entered.set()
-                await asyncio.Event().wait()
-            return await original_executor(function, *args)
+        async def pending_pause(seconds):
+            entered.set()
+            await asyncio.Event().wait()
 
-        self.coordinator.hass.async_add_executor_job = pending_validation
+        self.sleep.side_effect = pending_pause
         task = asyncio.create_task(self.coordinator._ensure_token())
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), timeout=2)
         self.assertTrue(self.entry.data[CONF_AUTH_SESSION_LIMIT])
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
         self.assertTrue(self.entry.data[CONF_AUTH_SESSION_LIMIT])
         self.assertEqual(self.entry.data[CONF_TOKEN], self.expired)
+        self.assertEqual(self.entry.data[CONF_RETRY_NOT_BEFORE], deadline)
         self.coordinator._api.login.assert_called_once()
         self.assertFalse(self.coordinator._request_gate["lock"].locked())
 
@@ -337,6 +349,7 @@ class ExistingSessionReuseTests(OfflineTests):
         self.assert_no_paid_login()
 
     async def test_candidate_expiring_in_gate_wait_is_not_sent_or_adopted(self):
+        self.entry.data["password"] = ""
         self.entry.data[CONF_AUTH_SESSION_LIMIT] = True
         self.source.data[CONF_TOKEN] = self.jwt(expiry=self.clock + 0.5)
         self.coordinator._request_gate["next_request_at"] = self.clock + 1

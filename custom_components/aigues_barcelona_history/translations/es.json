@@ -10,9 +10,10 @@
       "invalid_auth": "The account credentials or supplied token were rejected.",
       "token_expired": "The supplied token has expired. Supply a current token or submit credentials to sign in.",
       "cannot_connect": "The provider could not be reached or returned invalid data. Try again later.",
-      "auth_session_limit": "Aigües has reached its session limit. Close an existing provider session or supply a valid token before trying again. Automatic sign-in is paused.",
+      "auth_session_limit": "Aigües has reached its session limit. Saved credentials are kept. Configured integrations retry automatically after a pause. For new setup, wait before submitting again.",
       "no_contracts": "No available water contracts were returned for this account.",
-      "invalid_settings": "Use whole days between 1 and 1825, a refresh interval between 15 and 1440 minutes, and a whole number of seconds."
+      "invalid_settings": "Use whole days between 1 and 1825, a refresh interval between 15 and 1440 minutes, and a whole number of seconds.",
+      "retry_pending": "A provider retry pause is active. Saved credentials are kept. Configured integrations retry automatically when the pause ends."
     },
     "step": {
       "user": {
@@ -40,7 +41,7 @@
           "token": "Existing access token (optional)"
         },
         "title": "Aigües Barcelona History: sign in again",
-        "description": "Opening this form does not sign in. Submit without a token to use the saved credentials and pay for one CAPTCHA, or provide an existing token to validate it without a new login. The existing account and configured contracts are preserved."
+        "description": "Leave credential fields blank to keep their saved values. Opening this form does not sign in. Submit without a token to sign in with the saved credentials and pay for one CAPTCHA, or provide an existing token to validate it without a new login. Provider retry pauses still apply."
       },
       "import_settings": {
         "title": "History import settings",

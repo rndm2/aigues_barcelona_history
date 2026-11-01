@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.4 — 2026-11-01
+
+- Retry provider session limits automatically after a persisted cooldown instead of requiring manual reauthentication.
+- Increase repeated session-limit pauses from 30 minutes to six hours and respect longer provider Retry-After values.
+- Schedule the next update through Home Assistant, retaining the pause across restarts and serializing background and submitted logins.
+- Recover entries left blocked by earlier versions without replacing credentials, source history or statistic IDs.
+- Preserve saved credentials when optional reauthentication fields are left blank and resume normal catch-up imports after recovery.
+
 ## 0.5.3 — 2026-10-30
 
 - Publish all three owned consumption statistics in litres for native HA graphs.
