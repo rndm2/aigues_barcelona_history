@@ -689,9 +689,10 @@ class IdentityAndIsolationTests(OfflineTests):
         lookup = Mock(return_value=None)
         flow = config_flow.AiguesBarcelonaHistoryConfigFlow()
         flow.hass = SimpleNamespace(
+            data={},
             config_entries=SimpleNamespace(
                 async_entry_for_domain_unique_id=lookup, async_entries=Mock(return_value=[])
-            )
+            ),
         )
         flow.handler, flow.flow_id, flow.context = (
             DOMAIN,

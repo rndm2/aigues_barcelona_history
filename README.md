@@ -59,15 +59,25 @@ Supply your DNI/NIE and either:
 Credentials and the token are saved in HA's config-entry storage. Never share
 that storage or paste credentials into issues. Expired tokens use the configured
 credentials during normal updates. A confirmed session-limit error pauses
-automatic sign-in until successful recovery. Consumption GET retries do not
-repeat a login or purchase additional CAPTCHAs.
+requests for 30 minutes, then retries automatically. Repeated session-limit
+failures increase the pause to one, two, four and finally six hours. A longer
+provider `Retry-After` takes precedence. The deadline and attempt count survive
+restarts. Session limits do not require re-entering credentials or opening a
+sign-in form. Each new credential login can incur one CAPTCHA charge.
 
 During background updates, History checks for an unexpired session already
 configured by an Aigües integration for the same account before buying another
 login. The provider must confirm access to every configured History contract.
 History updates only its own entry, without changing or logging out the source
 session. Other integrations remain optional. If no usable session exists, a
-confirmed session-limit block still prevents another automatic paid login.
+new login waits for any saved retry pause. Background refreshes and submitted
+sign-in forms share one login lock, so they cannot sign in concurrently.
+Successful recovery resets the session-limit backoff and resumes imports.
+Existing history is retained while waiting. Recent missed readings are fetched
+by the normal refresh; older incomplete days retain their existing retry queue.
+An old session-limit block without a retry deadline is retried on the next
+refresh. In a genuine reauthentication form, blank credential fields retain
+their saved values.
 
 ## Settings and buttons
 
@@ -321,7 +331,8 @@ independent configured imports.
 
 For missing hours, inspect coverage and request the relevant range. A successful
 empty response is not a zero-consumption reading. For authentication limits,
-recover a valid session before trying another login. For recorder integrity
+allow the automatic retry pause to finish; repeatedly submitting a sign-in form
+does not bypass it. For recorder integrity
 errors, preserve the Store/database and restore a consistent backup.
 
 Download the integration diagnostics when reporting a problem. They omit

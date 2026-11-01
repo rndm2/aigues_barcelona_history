@@ -11,7 +11,6 @@ import unittest
 from unittest.mock import Mock, patch
 
 from homeassistant.const import CONF_PASSWORD
-from homeassistant.exceptions import ConfigEntryAuthFailed
 import requests
 from test_aigues_barcelona_history import OfflineTests, make_coordinator
 
@@ -211,9 +210,9 @@ class ResponseSafetyTests(unittest.TestCase):
                         client._query("/meter/consumptions")
                     self.assertEqual(caught.exception.status_code, status)
                     self.assertEqual(caught.exception.error_code, "MAX_SESSIONS")
-                    self.assertIsInstance(caught.exception, AiguesApiAuthError)
+                    self.assertIsInstance(caught.exception, provider.AiguesApiRateLimitError)
+                    self.assertNotIsInstance(caught.exception, AiguesApiAuthError)
                     self.assertNotIsInstance(caught.exception, AiguesApiServerError)
-                    self.assertNotIsInstance(caught.exception, AiguesApiRateLimitError)
                     self.assertNotIn(PRIVATE, str(caught.exception))
                     session.request.assert_called_once()
 
@@ -372,7 +371,7 @@ class ObservedSessionLimitCoordinatorTests(OfflineTests):
 
     async def test_actual_login_code_persists_guard_and_blocks_a_restarted_coordinator(self):
         session = self.bind_client(self.coordinator)
-        with self.assertRaises(ConfigEntryAuthFailed):
+        with self.assertRaises(AiguesApiSessionLimitError):
             await self.coordinator._ensure_token()
         self.assertTrue(self.entry.data[CONF_AUTH_SESSION_LIMIT])
         self.solver.recaptcha.assert_called_once()
@@ -381,9 +380,9 @@ class ObservedSessionLimitCoordinatorTests(OfflineTests):
         restarted = make_coordinator()
         restarted.hass = self.coordinator.hass
         restarted_session = self.bind_client(restarted)
-        # Even clearing the API's in-memory cooldown cannot bypass the saved flag.
+        # Clearing the API's in-memory cooldown cannot bypass the saved deadline.
         AiguesBarcelonaHistoryApiClient._global_captcha_cooldown_until = None
-        with self.assertRaises(ConfigEntryAuthFailed):
+        with self.assertRaises(provider.AiguesApiRateLimitError):
             await restarted._ensure_token()
         restarted_session.request.assert_not_called()
         self.solver.recaptcha.assert_called_once()
@@ -391,7 +390,7 @@ class ObservedSessionLimitCoordinatorTests(OfflineTests):
     async def test_actual_consumption_code_also_persists_guard_without_buying_a_solution(self):
         session = self.bind_client(self.coordinator, status=200)
         self.coordinator._api.is_token_expired = Mock(return_value=False)
-        with self.assertRaises((AiguesApiSessionLimitError, ConfigEntryAuthFailed)):
+        with self.assertRaises(AiguesApiSessionLimitError):
             await self.coordinator._request_consumptions(
                 date(2026, 10, 27), date(2026, 10, 28), Frequency.HOURLY
             )

@@ -51,6 +51,7 @@ from .api import (
     AiguesApiSessionLimitError,
     AiguesBarcelonaHistoryApiClient,
 )
+from .auth_retry import clear_session_retry, retry_delay, session_retry_updates
 from .backfill import (
     MAX_HOURLY_BACKFILL_REQUESTS,
     REGULAR_HOURLY_LOOKBACK_DAYS,
@@ -285,12 +286,6 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         if data != entry.data:
             self.hass.config_entries.async_update_entry(entry, data=data)
 
-    def _session_limit_failure(self) -> ConfigEntryAuthFailed:
-        self._update_entry_data(**{CONF_AUTH_SESSION_LIMIT: True})
-        return ConfigEntryAuthFailed(
-            "Aigües session limit requires explicit authentication recovery"
-        )
-
     def _existing_session_tokens(self, account: str):
         """Read only configured account/token fields, never another integration's runtime."""
         tokens = []
@@ -334,9 +329,9 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                             continue
                         rows = await self.hass.async_add_executor_job(candidate.contracts, account)
                     self._assert_active()
-                except AiguesApiSessionLimitError:
-                    self._update_entry_data(**{CONF_AUTH_SESSION_LIMIT: True})
-                    continue
+                except AiguesApiSessionLimitError as err:
+                    self._persist_retry_pause(err)
+                    raise
                 except AiguesApiAuthError:
                     self._assert_active()
                     continue
@@ -362,7 +357,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                 self._update_entry_data(
                     **{
                         CONF_TOKEN: validated_token,
-                        CONF_AUTH_SESSION_LIMIT: False,
+                        **clear_session_retry(self._entry().data),
                     }
                 )
                 _LOGGER.info("Reused a provider-validated configured Aigües session")
@@ -372,9 +367,10 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
         return False
 
     async def _ensure_token(self) -> None:
-        """Prefer existing sessions and never retry a known blocked paid login."""
+        """Serialize authentication and honor durable pauses before retrying."""
         async with self._token_lock:
             self._assert_active()
+            await self._wait_for_request(0)
             entry = self._entry()
             if not entry.data.get(CONF_AUTH_SESSION_LIMIT, False):
                 if not self._api.is_token_expired():
@@ -385,26 +381,22 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                         return
             if await self._reuse_existing_session():
                 return
-            if entry.data.get(CONF_AUTH_SESSION_LIMIT, False):
-                raise self._session_limit_failure()
             if not entry.data.get(CONF_PASSWORD) or not entry.data.get(CONF_2CAPTCHA_APIKEY):
                 raise ConfigEntryAuthFailed("Provide a current token or sign-in credentials")
             try:
                 login_ok = await self.hass.async_add_executor_job(self._api.login)
             except AiguesApiSessionLimitError as err:
-                self._update_entry_data(**{CONF_AUTH_SESSION_LIMIT: True})
-                # Another configured entry may have renewed its session while our
-                # one paid attempt was in flight. Recheck once, never buy a retry.
-                if await self._reuse_existing_session():
-                    return
-                raise self._session_limit_failure() from err
+                self._persist_retry_pause(err)
+                raise
             self._assert_active()
             token = self._api.get_token()
             if not login_ok or not token:
                 raise RuntimeError("Aigües login did not return a token")
             if self._api.is_token_expired():
                 raise RuntimeError("Aigües login returned an expired or invalid token")
-            self._update_entry_data(**{CONF_TOKEN: token})
+            self._update_entry_data(
+                **{CONF_TOKEN: token, **clear_session_retry(self._entry().data)}
+            )
 
     async def _async_update_data(self):
         try:
@@ -418,6 +410,13 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                     tuple(Frequency),
                 )
                 await self._recheck_incomplete_hours()
+        except AiguesApiRateLimitError as err:
+            self._set_import_status(phase="retrying", last_error=type(err).__name__)
+            delay = max(retry_delay(self._entry().data), err.retry_after or 0)
+            raise UpdateFailed(
+                "History import is waiting for the provider retry pause",
+                retry_after=max(1, delay or effective_settings(self._entry())[CONF_SCAN_PERIOD]),
+            ) from err
         except AiguesApiAuthError as err:
             raise ConfigEntryAuthFailed from err
         except ConfigEntryAuthFailed:
@@ -590,14 +589,7 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
     async def _wait_for_request(self, backoff: float, *, minimum_delay: float = 0) -> None:
         while True:
             self._assert_active()
-            deadline = self._entry().data.get(CONF_RETRY_NOT_BEFORE, 0)
-            if (
-                isinstance(deadline, bool)
-                or not isinstance(deadline, (int, float))
-                or not math.isfinite(deadline)
-            ):
-                raise ValueError("Invalid stored provider retry deadline")
-            delay = max(backoff, deadline - time.time(), minimum_delay)
+            delay = max(backoff, retry_delay(self._entry().data), minimum_delay)
             if delay > MAX_INLINE_RETRY_SECONDS:
                 raise AiguesApiRateLimitError(
                     "Provider retry pause is still active", retry_after=delay
@@ -640,6 +632,9 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
 
     def _persist_retry_pause(self, error) -> None:
         """Keep consumption and session validation pauses under one provider policy."""
+        if isinstance(error, AiguesApiSessionLimitError):
+            self._update_entry_data(**session_retry_updates(self._entry().data, error))
+            return
         if (retry_after := getattr(error, "retry_after", None)) is not None:
             deadline = max(
                 self._entry().data.get(CONF_RETRY_NOT_BEFORE, 0), time.time() + retry_after
@@ -675,12 +670,16 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                     rows = await self.hass.async_add_executor_job(request)
                     self._assert_active()
                     deadline = self._entry().data.get(CONF_RETRY_NOT_BEFORE, 0)
+                    recovered = clear_session_retry(self._entry().data)
                     if deadline and deadline <= time.time():
-                        self._update_entry_data(**{CONF_RETRY_NOT_BEFORE: 0})
+                        recovered[CONF_RETRY_NOT_BEFORE] = 0
+                    if recovered:
+                        self._update_entry_data(**recovered)
                     self._set_import_status(phase="running", last_error=None)
                     return rows
                 except AiguesApiSessionLimitError as err:
-                    raise self._session_limit_failure() from err
+                    self._persist_retry_pause(err)
+                    raise
                 except (
                     Timeout,
                     ConnectionError,
@@ -801,6 +800,8 @@ class AiguesHistoryCoordinator(DataUpdateCoordinator):
                         )
                         status["completed_days"] += int(day not in still_pending)
                         status["pending_days"] = len(still_pending)
+                    if isinstance(error, AiguesApiSessionLimitError):
+                        raise error
                     if isinstance(error, AiguesApiRateLimitError) or not attempted:
                         break
             finally:

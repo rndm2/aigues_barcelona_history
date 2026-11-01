@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from homeassistant import config_entries
@@ -21,9 +22,11 @@ from .api import (
     AiguesApiSessionLimitError,
     AiguesBarcelonaHistoryApiClient,
 )
+from .auth_retry import clear_session_retry, retry_delay, session_retry_updates
 from .const import (
     CONF_2CAPTCHA_APIKEY,
     CONF_AUTH_SESSION_LIMIT,
+    CONF_AUTH_SESSION_LIMIT_ATTEMPTS,
     CONF_CONTRACT,
     CONF_RETRY_NOT_BEFORE,
     DOMAIN,
@@ -113,6 +116,7 @@ async def validate_credentials(hass: HomeAssistant, data: dict[str, Any]) -> dic
             CONF_TOKEN: token,
             CONF_AUTH_SESSION_LIMIT: False,
             CONF_RETRY_NOT_BEFORE: 0,
+            **clear_session_retry(data),
         }
     except AiguesApiSessionLimitError:
         raise
@@ -129,6 +133,8 @@ async def validate_credentials(hass: HomeAssistant, data: dict[str, Any]) -> dic
         ValueError,
     ) as err:
         raise CannotConnect from err
+    finally:
+        api.cli.close()
 
 
 class AiguesBarcelonaHistoryOptionsFlow(config_entries.OptionsFlowWithReload):
@@ -243,8 +249,16 @@ class AiguesBarcelonaHistoryConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
 
     async def _process_input(self, user_input: dict, step_id: str) -> FlowResult:
         # Do not silently reuse the expired saved token for a credential retry.
-        data = {key: value for key, value in self.stored_input.items() if key != CONF_TOKEN}
-        data.update(user_input)
+        saved = self.entry.data if self.entry is not None else self.stored_input
+        data = {key: value for key, value in saved.items() if key != CONF_TOKEN}
+        for key, value in user_input.items():
+            if (
+                self.entry is not None
+                and key in (CONF_USERNAME, CONF_PASSWORD, CONF_2CAPTCHA_APIKEY)
+                and not value
+            ):
+                continue
+            data[key] = value
         data.setdefault(CONF_PASSWORD, "")
         data.setdefault(CONF_2CAPTCHA_APIKEY, "")
         errors = {}
@@ -261,7 +275,16 @@ class AiguesBarcelonaHistoryConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
                 await self.async_set_unique_id(f"{DOMAIN}_{data[CONF_USERNAME]}")
                 self._abort_if_unique_id_configured()
             self.stored_input = dict(data)
-            info = await validate_credentials(self.hass, data)
+            token_lock = self.hass.data.setdefault(DOMAIN, {}).setdefault(
+                "_token_lock", asyncio.Lock()
+            )
+            async with token_lock:
+                # Background refreshes and submitted forms share one login lock.
+                # Recheck persisted pauses after waiting for another sign-in.
+                retry_state = self.entry.data if self.entry is not None else data
+                if retry_delay(retry_state):
+                    return self._form(step_id, {"base": "retry_pending"})
+                info = await validate_credentials(self.hass, data)
             configured = self.entry.data[CONF_CONTRACT] if self.entry else info[CONF_CONTRACT]
             if not contracts_include(info[CONF_CONTRACT], configured):
                 raise InvalidAuth
@@ -270,18 +293,34 @@ class AiguesBarcelonaHistoryConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             ):
                 return self.async_abort(reason="contract_already_configured")
             if self.entry is not None:
+                # A concurrent consumption GET may have established a newer
+                # pause while this form was validating its token.
+                if retry_delay(self.entry.data):
+                    info.update(
+                        {
+                            key: self.entry.data.get(key, 0)
+                            for key in (
+                                CONF_AUTH_SESSION_LIMIT,
+                                CONF_AUTH_SESSION_LIMIT_ATTEMPTS,
+                                CONF_RETRY_NOT_BEFORE,
+                            )
+                        }
+                    )
                 return self.async_update_reload_and_abort(
                     self.entry,
                     data_updates={**data, **info, CONF_CONTRACT: configured},
                 )
             self._validated_input = {**data, **info}
             return await self.async_step_import_settings()
-        except AiguesApiSessionLimitError:
+        except AiguesApiSessionLimitError as err:
             errors["base"] = CONF_AUTH_SESSION_LIMIT
+            saved = self.entry.data if self.entry is not None else self.stored_input
+            updates = session_retry_updates(saved, err)
+            self.stored_input.update(updates)
             if self.entry is not None:
                 self.hass.config_entries.async_update_entry(
                     self.entry,
-                    data={**self.entry.data, CONF_AUTH_SESSION_LIMIT: True},
+                    data={**self.entry.data, **updates},
                 )
         except TokenExpired:
             errors["base"] = "token_expired"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -13,7 +14,7 @@ from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components import aigues_barcelona_history as integration
-from custom_components.aigues_barcelona_history import config_flow, sensor, service
+from custom_components.aigues_barcelona_history import auth_retry, config_flow, sensor, service
 from custom_components.aigues_barcelona_history.api import (
     AiguesApiAuthError,
     AiguesApiServerError,
@@ -22,6 +23,7 @@ from custom_components.aigues_barcelona_history.api import (
 from custom_components.aigues_barcelona_history.const import (
     CONF_2CAPTCHA_APIKEY,
     CONF_AUTH_SESSION_LIMIT,
+    CONF_AUTH_SESSION_LIMIT_ATTEMPTS,
     CONF_CONTRACT,
     CONF_RETRY_NOT_BEFORE,
     CONF_SCAN_PERIOD,
@@ -142,6 +144,107 @@ class EntrySafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["reason"], "reauth_successful")
         self.assertEqual(self.entry.unique_id, f"{DOMAIN}_{USER}")
 
+    async def test_reauth_pause_blocks_both_credentials_and_existing_token(self):
+        self.entry.data.update(
+            {
+                CONF_AUTH_SESSION_LIMIT: True,
+                CONF_AUTH_SESSION_LIMIT_ATTEMPTS: 2,
+                CONF_RETRY_NOT_BEFORE: 2000,
+            }
+        )
+        before = deepcopy(self.entry.data)
+        for submitted in ({}, {CONF_TOKEN: "fresh-token"}):
+            with self.subTest(submitted=submitted):
+                flow = self.flow("reauth")
+                await flow.async_step_reauth(self.entry.data)
+                with patch.object(auth_retry.time, "time", return_value=1000):
+                    result = await flow.async_step_reauth_confirm(submitted)
+                self.assertEqual(result["errors"], {"base": "retry_pending"})
+                self.api.login.assert_not_called()
+                self.api.contracts.assert_not_called()
+                self.entries.async_update_entry.assert_not_called()
+                self.assertEqual(self.entry.data, before)
+
+    async def test_reauth_rechecks_pause_after_waiting_for_shared_login_lock(self):
+        lock = asyncio.Lock()
+        self.hass.data[DOMAIN] = {"_token_lock": lock}
+        await lock.acquire()
+        flow = self.flow("reauth")
+        await flow.async_step_reauth(self.entry.data)
+        with patch.object(auth_retry.time, "time", return_value=1000):
+            task = asyncio.create_task(flow.async_step_reauth_confirm({}))
+            try:
+                await asyncio.sleep(0)
+                self.api.login.assert_not_called()
+                self.assertFalse(task.done())
+                self.entry.data[CONF_RETRY_NOT_BEFORE] = 2000
+            finally:
+                lock.release()
+            result = await asyncio.wait_for(task, timeout=2)
+        self.assertEqual(result["errors"], {"base": "retry_pending"})
+        self.api.login.assert_not_called()
+        self.api.contracts.assert_not_called()
+
+    async def test_blank_reauth_fields_preserve_credentials_for_login_and_token(self):
+        for token in ("", "fresh-token"):
+            with self.subTest(token=token):
+                self.api.reset_mock()
+                flow = self.flow("reauth")
+                await flow.async_step_reauth(self.entry.data)
+                flow.async_update_reload_and_abort = Mock(return_value={"type": "abort"})
+                await flow.async_step_reauth_confirm(
+                    {**{key: "" for key in CREDENTIALS}, CONF_TOKEN: token}
+                )
+                self.client.assert_called_with(USER, "unused", "unused")
+                updates = flow.async_update_reload_and_abort.call_args.kwargs["data_updates"]
+                self.assertEqual({key: updates[key] for key in CREDENTIALS}, CREDENTIALS)
+                self.assertEqual(updates[CONF_CONTRACT], ["ONE"])
+                self.api.contracts.assert_called_once_with(USER)
+                self.assertEqual(self.api.login.call_count, 0 if token else 1)
+                self.api.cli.close.assert_called_once_with()
+
+    async def test_successful_reauth_after_pause_clears_attempt_count(self):
+        self.entry.data.update(
+            {
+                CONF_AUTH_SESSION_LIMIT: True,
+                CONF_AUTH_SESSION_LIMIT_ATTEMPTS: 4,
+                CONF_RETRY_NOT_BEFORE: 999,
+            }
+        )
+        flow = self.flow("reauth")
+        await flow.async_step_reauth(self.entry.data)
+        flow.async_update_reload_and_abort = Mock(return_value={"type": "abort"})
+        with patch.object(auth_retry.time, "time", return_value=1000):
+            await flow.async_step_reauth_confirm({})
+        updates = flow.async_update_reload_and_abort.call_args.kwargs["data_updates"]
+        self.assertFalse(updates[CONF_AUTH_SESSION_LIMIT])
+        self.assertEqual(updates[CONF_AUTH_SESSION_LIMIT_ATTEMPTS], 0)
+        self.assertEqual(updates[CONF_RETRY_NOT_BEFORE], 0)
+        self.assertEqual({key: updates[key] for key in CREDENTIALS}, CREDENTIALS)
+        self.api.login.assert_called_once_with()
+
+    async def test_reauth_success_preserves_newer_pause_from_concurrent_request(self):
+        later_pause = {
+            CONF_AUTH_SESSION_LIMIT: True,
+            CONF_AUTH_SESSION_LIMIT_ATTEMPTS: 3,
+            CONF_RETRY_NOT_BEFORE: 8000,
+        }
+
+        def contracts(*_):
+            self.entry.data.update(later_pause)
+            return [{"contractDetail": {"contractNumber": "ONE"}}]
+
+        self.api.contracts.side_effect = contracts
+        flow = self.flow("reauth")
+        await flow.async_step_reauth(self.entry.data)
+        flow.async_update_reload_and_abort = Mock(return_value={"type": "abort"})
+        with patch.object(auth_retry.time, "time", return_value=1000):
+            await flow.async_step_reauth_confirm({CONF_TOKEN: "fresh-token"})
+        updates = flow.async_update_reload_and_abort.call_args.kwargs["data_updates"]
+        self.assertEqual({key: updates[key] for key in later_pause}, later_pause)
+        self.assertEqual({key: updates[key] for key in CREDENTIALS}, CREDENTIALS)
+        self.api.login.assert_not_called()
+
     async def test_changed_reauth_account_is_rejected_before_validation(self):
         flow = self.flow("reauth")
         await flow.async_step_reauth(self.entry.data)
@@ -193,6 +296,7 @@ class EntrySafetyTests(unittest.IsolatedAsyncioTestCase):
         self.api.contracts.assert_called_once_with(USER)
         self.assertFalse(info[CONF_AUTH_SESSION_LIMIT])
         self.assertEqual(info[CONF_RETRY_NOT_BEFORE], 0)
+        self.api.cli.close.assert_called_once_with()
 
     async def test_wrong_or_missing_token_account_is_rejected_before_get_or_login(self):
         for claim in ("Y1234567L", None, 123):
@@ -254,6 +358,24 @@ class EntrySafetyTests(unittest.IsolatedAsyncioTestCase):
         result = await self.flow().async_step_user(CREDENTIALS)
         self.assertEqual(result["errors"], {"base": "cannot_connect"})
         self.api.login.assert_called_once_with()
+        self.api.cli.close.assert_called_once_with()
+
+    async def test_cancelled_credential_validation_closes_temporary_client(self):
+        entered = asyncio.Event()
+        never_complete = asyncio.Event()
+
+        async def wait_for_executor(function, *args):
+            entered.set()
+            await never_complete.wait()
+
+        self.hass.async_add_executor_job = wait_for_executor
+        task = asyncio.create_task(config_flow.validate_credentials(self.hass, CREDENTIALS))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.api.cli.close.assert_called_once_with()
+        self.api.contracts.assert_not_called()
 
     async def test_login_without_a_usable_token_is_not_reported_as_bad_credentials(self):
         self.api.login.return_value = False
@@ -295,9 +417,29 @@ class EntrySafetyTests(unittest.IsolatedAsyncioTestCase):
         self.api.login.side_effect = AiguesApiSessionLimitError("session limit")
         flow = self.flow("reauth")
         await flow.async_step_reauth(self.entry.data)
-        result = await flow.async_step_reauth_confirm({})
+        with patch.object(auth_retry.time, "time", return_value=1000):
+            result = await flow.async_step_reauth_confirm({})
+            self.assertEqual(self.entry.data[CONF_AUTH_SESSION_LIMIT_ATTEMPTS], 1)
+            self.assertEqual(self.entry.data[CONF_RETRY_NOT_BEFORE], 2800)
+            retry = await flow.async_step_reauth_confirm({})
+            self.assertEqual(retry["errors"], {"base": "retry_pending"})
+            self.assertEqual(self.entry.data[CONF_AUTH_SESSION_LIMIT_ATTEMPTS], 1)
         self.assertEqual(result["errors"], {"base": CONF_AUTH_SESSION_LIMIT})
         self.assertTrue(self.entry.data[CONF_AUTH_SESSION_LIMIT])
+        self.api.login.assert_called_once_with()
+        self.api.cli.close.assert_called_once_with()
+
+    async def test_new_setup_session_limit_keeps_pause_between_submissions(self):
+        self.api.login.side_effect = AiguesApiSessionLimitError("session limit")
+        flow = self.flow()
+        with patch.object(auth_retry.time, "time", return_value=1000):
+            result = await flow.async_step_user(CREDENTIALS)
+            retry = await flow.async_step_user(CREDENTIALS)
+        self.assertEqual(result["errors"], {"base": CONF_AUTH_SESSION_LIMIT})
+        self.assertEqual(retry["errors"], {"base": "retry_pending"})
+        self.assertEqual(flow.stored_input[CONF_AUTH_SESSION_LIMIT_ATTEMPTS], 1)
+        self.assertEqual(flow.stored_input[CONF_RETRY_NOT_BEFORE], 2800)
+        self.entries.async_update_entry.assert_not_called()
         self.api.login.assert_called_once_with()
 
     async def test_new_entry_cannot_claim_contract_reserved_by_another_entry(self):
